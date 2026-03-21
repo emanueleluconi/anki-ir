@@ -27,5 +27,6 @@
     "key_later_today": "Shift+l",
     "key_advance_today": "Shift+a",
     "key_edit_last": "Shift+e",
+    "key_undo_text": "Ctrl+z",
     "key_prepare": "Ctrl+Shift+p"
 }

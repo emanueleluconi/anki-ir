@@ -19,7 +19,8 @@ def show_settings():
         "key_reschedule": "Shift+j", "key_execute_rep": "Shift+r",
         "key_postpone": "Shift+w", "key_done": "Shift+d", "key_forget": "Shift+f",
         "key_later_today": "Shift+l", "key_advance_today": "Shift+a",
-        "key_edit_last": "Shift+e", "key_prepare": "Ctrl+Shift+p",
+        "key_edit_last": "Shift+e", "key_undo_text": "Ctrl+z",
+        "key_prepare": "Ctrl+Shift+p",
     }
     for k, v in defaults.items():
         if k not in conf: conf[k] = v
@@ -88,6 +89,7 @@ def show_settings():
         ("key_done", "Done", "str"),
         ("key_forget", "Forget/park", "str"),
         ("key_edit_last", "Edit last created", "str"),
+        ("key_undo_text", "Undo text change", "str"),
         ("key_prepare", "Prepare topics", "str"),
     ])
 

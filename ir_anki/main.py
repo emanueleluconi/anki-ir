@@ -43,13 +43,15 @@ def cfg(key):
         "key_reschedule": "Shift+j", "key_execute_rep": "Shift+r",
         "key_postpone": "Shift+w", "key_done": "Shift+d", "key_forget": "Shift+f",
         "key_later_today": "Shift+l", "key_advance_today": "Shift+a",
-        "key_edit_last": "Shift+e", "key_prepare": "Ctrl+Shift+p",
+        "key_edit_last": "Shift+e", "key_undo_text": "Ctrl+z",
+        "key_prepare": "Ctrl+Shift+p",
     }
     return c.get(key, defaults.get(key))
 
 
 _last_created_nid: Optional[int] = None
 _ir_toolbar: Optional[QToolBar] = None
+_text_history: dict = {}  # nid → list of previous Text field values (for undo)
 
 
 def _is_topic_card(card: Card) -> bool:
@@ -75,18 +77,18 @@ def _shelve(card: Card):
 
 
 def _ask_new_source_priority(sources):
-    """Per-source priority dialog. Each source gets its own priority input.
-    Enter = confirm priority for selected item and move to next.
-    Ctrl+Enter = apply all and close.
-    Esc = abort (use defaults for all).
+    """Per-source priority dialog.
+    - Each source has its own slider + number input + today checkbox
+    - Preset buttons apply to the FOCUSED source only
+    - Enter = save current input, move focus to next source
+    - Ctrl+Enter = apply all and close
+    - Esc / Cancel = abort, use defaults for all
     """
     from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                          QSlider, QPushButton, QCheckBox, QScrollArea, QWidget,
                          QGridLayout, Qt, QShortcut, QKeySequence)
 
-    default_p = cfg("default_priority")
-
-    # Per-source state: list of {card, note, priority, today}
+    default_p = int(cfg("default_priority"))
     items = []
     for card, note in sources:
         title = note.fields[0][:80] if note.fields else "?"
@@ -94,138 +96,141 @@ def _ask_new_source_priority(sources):
 
     dlg = QDialog(mw)
     dlg.setWindowTitle(f"New Sources ({len(items)})")
-    dlg.setMinimumWidth(520)
-    dlg.setMinimumHeight(min(400, 120 + len(items) * 40))
+    dlg.setMinimumWidth(560)
+    dlg.setMinimumHeight(min(500, 160 + len(items) * 45))
     main_layout = QVBoxLayout()
+    main_layout.addWidget(QLabel(f"{len(items)} new source(s). Set priority per source:"))
 
-    main_layout.addWidget(QLabel(f"{len(items)} new source(s). Set priority per source (Enter=next, Ctrl+Enter=apply all):"))
-
-    # Scrollable area for per-source rows
-    scroll = QScrollArea()
-    scroll.setWidgetResizable(True)
-    container = QWidget()
-    grid = QGridLayout()
-    grid.setColumnStretch(0, 3)  # title
-    grid.setColumnStretch(1, 1)  # slider
-    grid.setColumnStretch(2, 0)  # input
-    grid.setColumnStretch(3, 0)  # today checkbox
-
+    # Scrollable grid
+    scroll = QScrollArea(); scroll.setWidgetResizable(True)
+    container = QWidget(); grid = QGridLayout()
+    grid.setColumnStretch(0, 3); grid.setColumnStretch(1, 2)
+    grid.setColumnStretch(2, 0); grid.setColumnStretch(3, 0)
     grid.addWidget(QLabel("Source"), 0, 0)
     grid.addWidget(QLabel("Priority"), 0, 1)
     grid.addWidget(QLabel(""), 0, 2)
     grid.addWidget(QLabel("Today"), 0, 3)
 
-    sliders = []
-    inputs = []
-    today_cbs = []
+    sliders = []; inputs = []; today_cbs = []
+    focused_idx = [0]  # track which input is focused
 
     for i, item in enumerate(items):
         row = i + 1
-        lbl = QLabel(item["title"])
-        lbl.setWordWrap(True)
+        lbl = QLabel(item["title"]); lbl.setWordWrap(True)
         grid.addWidget(lbl, row, 0)
 
         sl = QSlider(Qt.Orientation.Horizontal)
-        sl.setRange(0, 100); sl.setValue(int(default_p))
-        grid.addWidget(sl, row, 1)
-        sliders.append(sl)
+        sl.setRange(0, 100); sl.setValue(default_p)
+        grid.addWidget(sl, row, 1); sliders.append(sl)
 
-        inp = QLineEdit(str(int(default_p)))
-        inp.setFixedWidth(50)
-        grid.addWidget(inp, row, 2)
-        inputs.append(inp)
+        inp = QLineEdit(str(default_p)); inp.setFixedWidth(55)
+        grid.addWidget(inp, row, 2); inputs.append(inp)
 
-        cb = QCheckBox()
-        grid.addWidget(cb, row, 3)
-        today_cbs.append(cb)
+        cb = QCheckBox(); grid.addWidget(cb, row, 3); today_cbs.append(cb)
 
-        # Sync slider ↔ input
-        def _sync_sl(val, _inp=inp): _inp.setText(str(val))
-        def _sync_inp(_text=None, _sl=sl, _inp=inp):
-            try: _sl.blockSignals(True); _sl.setValue(int(float(_inp.text()))); _sl.blockSignals(False)
+        # Sync slider → input (use default args to capture correctly)
+        def _on_sl(val, _inp=inp): _inp.setText(str(val))
+        sl.valueChanged.connect(_on_sl)
+
+        # Sync input → slider
+        def _on_inp(_t=None, _sl=sl, _inp=inp):
+            try:
+                v = int(float(_inp.text()))
+                _sl.blockSignals(True); _sl.setValue(max(0, min(100, v))); _sl.blockSignals(False)
             except: pass
-        sl.valueChanged.connect(_sync_sl)
-        inp.textChanged.connect(_sync_inp)
+        inp.textChanged.connect(_on_inp)
 
-        # Enter on input = move focus to next input
+        # Track focus — use a wrapper function, not lambda with tuple return
+        def _make_focus_handler(_i, _inp):
+            _original = _inp.__class__.focusInEvent
+            def _handler(event):
+                focused_idx[0] = _i
+                _original(_inp, event)
+            return _handler
+        inp.focusInEvent = _make_focus_handler(i, inp)
+
+        # Enter = move to next input
         def _on_enter(_i=i):
-            # Save current value
-            try: items[_i]["p"] = max(0, min(100, float(inputs[_i].text())))
-            except: pass
-            items[_i]["today"] = today_cbs[_i].isChecked()
-            # Move to next
             if _i + 1 < len(inputs):
                 inputs[_i + 1].setFocus()
                 inputs[_i + 1].selectAll()
         inp.returnPressed.connect(_on_enter)
 
-    container.setLayout(grid)
-    scroll.setWidget(container)
+    container.setLayout(grid); scroll.setWidget(container)
     main_layout.addWidget(scroll)
 
-    # Quick preset row (applies to ALL sources)
+    # Preset buttons — apply to the FOCUSED source
     preset_row = QHBoxLayout()
-    preset_row.addWidget(QLabel("Set all:"))
+    preset_row.addWidget(QLabel("Quick set:"))
     for val in [10, 25, 50, 75, 90]:
         btn = QPushButton(f"{val}%")
-        def _set_all(_, v=val):
-            for sl, inp in zip(sliders, inputs):
-                sl.setValue(v); inp.setText(str(v))
-        btn.clicked.connect(_set_all)
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # don't steal focus from inputs
+        def _on_preset(checked, v=val):
+            idx = focused_idx[0]
+            sliders[idx].setValue(v)
+            inputs[idx].setText(str(v))
+        btn.clicked.connect(_on_preset)
         preset_row.addWidget(btn)
     main_layout.addLayout(preset_row)
 
-    # Buttons
+    # Buttons — none should be default (prevents Enter from triggering them)
     btn_row = QHBoxLayout()
     apply_btn = QPushButton("Apply All (Ctrl+Enter)")
-    skip_btn = QPushButton("Use Defaults (Esc)")
+    apply_btn.setAutoDefault(False); apply_btn.setDefault(False)
+    default_btn = QPushButton("Use Defaults")
+    default_btn.setAutoDefault(False); default_btn.setDefault(False)
+    cancel_btn = QPushButton("Cancel (Esc)")
+    cancel_btn.setAutoDefault(False); cancel_btn.setDefault(False)
     btn_row.addStretch()
-    btn_row.addWidget(apply_btn)
-    btn_row.addWidget(skip_btn)
+    btn_row.addWidget(apply_btn); btn_row.addWidget(default_btn); btn_row.addWidget(cancel_btn)
     main_layout.addLayout(btn_row)
 
-    applied = [False]
+    result = [None]  # "apply" | "defaults" | None (cancelled)
 
     def do_apply():
-        # Collect all values
         for i in range(len(items)):
             try: items[i]["p"] = max(0, min(100, float(inputs[i].text())))
             except: items[i]["p"] = default_p
             items[i]["today"] = today_cbs[i].isChecked()
-        applied[0] = True
-        dlg.accept()
+        result[0] = "apply"; dlg.accept()
 
-    def do_skip():
-        applied[0] = False
-        dlg.reject()
+    def do_defaults():
+        result[0] = "defaults"; dlg.accept()
+
+    def do_cancel():
+        result[0] = None; dlg.reject()
 
     apply_btn.clicked.connect(do_apply)
-    skip_btn.clicked.connect(do_skip)
+    default_btn.clicked.connect(do_defaults)
+    cancel_btn.clicked.connect(do_cancel)
 
-    # Ctrl+Enter = apply all
-    shortcut = QShortcut(QKeySequence("Ctrl+Return"), dlg)
-    shortcut.activated.connect(do_apply)
-
-    # Esc = skip/abort (QDialog default reject behavior)
-    dlg.rejected.connect(lambda: None)  # Esc triggers reject → do_skip
+    # Ctrl+Enter = apply
+    sc = QShortcut(QKeySequence("Ctrl+Return"), dlg); sc.activated.connect(do_apply)
 
     dlg.setLayout(main_layout)
     if inputs: inputs[0].setFocus(); inputs[0].selectAll()
     dlg.exec()
 
-    # Apply results
+    # Process results
+    if result[0] is None:
+        # Cancelled — don't init these sources at all, they stay uninitialised
+        return
+
     for i, item in enumerate(items):
         card, note = item["card"], item["note"]
-        m = get(note)
-        if applied[0]:
-            m["p"] = scheduler.clamp_priority(item["p"])
+        if result[0] == "apply":
+            p = scheduler.clamp_priority(item["p"])
         else:
-            m["p"] = scheduler.clamp_priority(default_p)
-        m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
-        if applied[0] and item["today"]:
+            p = scheduler.clamp_priority(default_p)
+        # NOW init the source with the chosen priority
+        init_source(note, p)
+        mw.col.update_note(note)
+        due_today = result[0] == "apply" and item["today"]
+        if due_today:
+            m = get(note)
             m["due"] = scheduler.today_str(); m["iv"] = 1
-        put(note, m); mw.col.update_note(note)
-        _set_review(card, 1, 0 if (applied[0] and item["today"]) else 1)
+            put(note, m); mw.col.update_note(note)
+        _set_review(card, 1, 0 if due_today else 1)
 
 
 # ============================================================
@@ -301,16 +306,18 @@ def _prepare_topics():
             _set_review(card, 1, 1)
             init_count += 1
         else:
-            # Source (or untagged): collect for batch priority dialog
-            init_source(note, cfg("default_priority"))
-            mw.col.update_note(note)
-            _set_review(card, 1, 1)
+            # Source (or untagged): collect for batch priority dialog — DON'T init yet
             new_sources.append((card, note))
-            init_count += 1
 
     # If there are new sources, show a dialog to set priority and schedule
     if new_sources:
         _ask_new_source_priority(new_sources)
+        # Count how many were actually initialised (dialog may have been cancelled)
+        for card, note in new_sources:
+            # Re-read note to check if it was initialised
+            fresh = mw.col.get_note(note.id)
+            if is_topic(fresh):
+                init_count += 1
 
     # Step 2: Auto-postpone
     postpone_count = 0
@@ -371,10 +378,11 @@ def _prepare_topics():
                 _set_review(card, max(1, m["iv"]), 30)
 
     parts = []
-    if init_count: parts.append(f"{init_count} initialized")
+    if init_count: parts.append(f"{init_count} new topics initialized")
+    if len(new_sources) and not init_count: parts.append(f"{len(new_sources)} sources skipped (cancelled)")
     if postpone_count: parts.append(f"{postpone_count} postponed")
     if orphan_count: parts.append(f"{orphan_count} orphans cleaned")
-    parts.append(f"{topics_to_show}/{len(queue)} topics ready")
+    parts.append(f"{topics_to_show}/{len(queue)} topics due today")
     tooltip(f"IR: {', '.join(parts)}")
 
 
@@ -446,6 +454,7 @@ def _setup_toolbar():
         (f"Advance [{cfg('key_advance_today')}]", _cmd_advance_today),
         (f"Done [{cfg('key_done')}]", _cmd_done),
         (f"Forget [{cfg('key_forget')}]", _cmd_forget),
+        (f"Undo [{cfg('key_undo_text')}]", _cmd_undo_text),
         (f"EditLast [{cfg('key_edit_last')}]", _cmd_edit_last),
     ]:
         btn = QToolButton(); btn.setText(label); btn.clicked.connect(fn)
@@ -481,6 +490,7 @@ def _set_shortcuts(shortcuts):
         (cfg("key_advance_today"), _cmd_advance_today),
         (cfg("key_done"), _cmd_done), (cfg("key_forget"), _cmd_forget),
         (cfg("key_edit_last"), _cmd_edit_last),
+        (cfg("key_undo_text"), _cmd_undo_text),
     ])
 
 
@@ -772,6 +782,24 @@ def _cmd_edit_last():
         tooltip(f"Error: {ex}")
 
 
+def _cmd_undo_text():
+    """Undo the last text modification (highlight) on the current card."""
+    card = mw.reviewer.card
+    if not card: return
+    note = card.note()
+    nid = note.id
+    if nid not in _text_history or not _text_history[nid]:
+        tooltip("Nothing to undo."); return
+    fnames = [f["name"] for f in note.note_type()["flds"]]
+    if "Text" not in fnames: tooltip("No Text field."); return
+    prev = _text_history[nid].pop()
+    note["Text"] = prev
+    mw.col.update_note(note)
+    # Refresh the displayed card
+    mw.reviewer._redraw_current_card()
+    tooltip("Undone")
+
+
 
 # ============================================================
 # Menu
@@ -816,17 +844,68 @@ def _init_topics():
 
 def _show_stats():
     if not mw.col: return
+    from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                         QListWidget, QListWidgetItem, QPushButton, Qt)
+    from .queue import _iter_topic_notes, build_queue
+
     today = date.today().isoformat()
     total = due = active = done = forgotten = 0
-    from .queue import _iter_topic_notes
+    avg_af = 0.0; avg_iv = 0.0; avg_p = 0.0
     for _, _, m in _iter_topic_notes(cfg("topics_deck")):
         total += 1
         if m["st"] == "active":
             active += 1
+            avg_af += m["af"]; avg_iv += m["iv"]; avg_p += m["p"]
             if m.get("due") and m["due"] <= today: due += 1
         elif m["st"] == "done": done += 1
         elif m["st"] == "forgotten": forgotten += 1
-    showInfo(f"IR Queue Stats\n\nTopics: {total}\nActive: {active}\nDue today: {due}\nDone: {done}\nForgotten: {forgotten}")
+    if active > 0:
+        avg_af /= active; avg_iv /= active; avg_p /= active
+
+    queue = build_queue(cfg("topics_deck"), cfg("randomization_degree"))
+
+    dlg = QDialog(mw)
+    dlg.setWindowTitle("IR Queue Stats")
+    dlg.setMinimumWidth(550); dlg.setMinimumHeight(400)
+    layout = QVBoxLayout()
+
+    # Stats summary
+    stats = (
+        f"Total: {total}  |  Active: {active}  |  Due today: {due}  |  "
+        f"Done: {done}  |  Forgotten: {forgotten}\n"
+        f"Avg priority: {avg_p:.1f}%  |  Avg AF: {avg_af:.2f}  |  Avg interval: {avg_iv:.0f}d"
+    )
+    lbl = QLabel(stats); lbl.setWordWrap(True)
+    layout.addWidget(lbl)
+
+    # Queue list
+    layout.addWidget(QLabel(f"Today's queue ({len(queue)} topics, sorted by priority):"))
+    lst = QListWidget()
+    for pos, nid in enumerate(queue):
+        try:
+            note = mw.col.get_note(nid)
+            m = get(note)
+            title = note.fields[0][:70] if note.fields else "?"
+            # Strip HTML for display
+            import re
+            title = re.sub(r'<[^>]+>', '', title).strip()[:70]
+            item = QListWidgetItem(
+                f"{pos+1}. [{m['p']:.0f}%] {title}  (I:{m['iv']}d AF:{m['af']:.2f})"
+            )
+            lst.addItem(item)
+        except:
+            continue
+    layout.addWidget(lst)
+
+    # Close button
+    close_btn = QPushButton("Close")
+    close_btn.clicked.connect(dlg.accept)
+    close_btn.setAutoDefault(False)
+    row = QHBoxLayout(); row.addStretch(); row.addWidget(close_btn)
+    layout.addLayout(row)
+
+    dlg.setLayout(layout)
+    dlg.exec()
 
 
 # ============================================================
@@ -850,9 +929,14 @@ class IRManager:
         card = mw.reviewer.card
         if card:
             note = card.note()
-            # Save the modified HTML to the Text field
             fnames = [f["name"] for f in note.note_type()["flds"]]
             if "Text" in fnames:
+                # Save previous text for undo
+                nid = note.id
+                if nid not in _text_history:
+                    _text_history[nid] = []
+                _text_history[nid].append(note["Text"])
+                # Apply new text
                 note["Text"] = html
                 mw.col.update_note(note)
         return (True, None)
