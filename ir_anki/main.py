@@ -75,88 +75,157 @@ def _shelve(card: Card):
 
 
 def _ask_new_source_priority(sources):
-    """Show dialog for newly imported sources to set priority and optionally schedule today."""
+    """Per-source priority dialog. Each source gets its own priority input.
+    Enter = confirm priority for selected item and move to next.
+    Ctrl+Enter = apply all and close.
+    Esc = abort (use defaults for all).
+    """
     from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-                         QSlider, QPushButton, QCheckBox, QListWidget, Qt)
+                         QSlider, QPushButton, QCheckBox, QScrollArea, QWidget,
+                         QGridLayout, Qt, QShortcut, QKeySequence)
+
+    default_p = cfg("default_priority")
+
+    # Per-source state: list of {card, note, priority, today}
+    items = []
+    for card, note in sources:
+        title = note.fields[0][:80] if note.fields else "?"
+        items.append({"card": card, "note": note, "title": title, "p": default_p, "today": False})
 
     dlg = QDialog(mw)
-    dlg.setWindowTitle(f"New Sources ({len(sources)})")
-    dlg.setMinimumWidth(420)
-    layout = QVBoxLayout()
+    dlg.setWindowTitle(f"New Sources ({len(items)})")
+    dlg.setMinimumWidth(520)
+    dlg.setMinimumHeight(min(400, 120 + len(items) * 40))
+    main_layout = QVBoxLayout()
 
-    layout.addWidget(QLabel(f"{len(sources)} new source(s) imported. Set priority:"))
+    main_layout.addWidget(QLabel(f"{len(items)} new source(s). Set priority per source (Enter=next, Ctrl+Enter=apply all):"))
 
-    # List the source names
-    lst = QListWidget()
-    for _, note in sources:
-        title = note.fields[0][:80] if note.fields else "?"
-        lst.addItem(title)
-    lst.setMaximumHeight(120)
-    layout.addWidget(lst)
+    # Scrollable area for per-source rows
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    container = QWidget()
+    grid = QGridLayout()
+    grid.setColumnStretch(0, 3)  # title
+    grid.setColumnStretch(1, 1)  # slider
+    grid.setColumnStretch(2, 0)  # input
+    grid.setColumnStretch(3, 0)  # today checkbox
 
-    # Priority slider + input
-    slider = QSlider(Qt.Orientation.Horizontal)
-    slider.setRange(0, 10000); slider.setValue(int(cfg("default_priority") * 100))
-    layout.addWidget(slider)
+    grid.addWidget(QLabel("Source"), 0, 0)
+    grid.addWidget(QLabel("Priority"), 0, 1)
+    grid.addWidget(QLabel(""), 0, 2)
+    grid.addWidget(QLabel("Today"), 0, 3)
 
-    row = QHBoxLayout()
-    row.addWidget(QLabel("Priority:"))
-    inp = QLineEdit(str(cfg("default_priority")))
-    inp.selectAll()
-    row.addWidget(inp)
-    layout.addLayout(row)
+    sliders = []
+    inputs = []
+    today_cbs = []
 
-    # Quick presets
+    for i, item in enumerate(items):
+        row = i + 1
+        lbl = QLabel(item["title"])
+        lbl.setWordWrap(True)
+        grid.addWidget(lbl, row, 0)
+
+        sl = QSlider(Qt.Orientation.Horizontal)
+        sl.setRange(0, 100); sl.setValue(int(default_p))
+        grid.addWidget(sl, row, 1)
+        sliders.append(sl)
+
+        inp = QLineEdit(str(int(default_p)))
+        inp.setFixedWidth(50)
+        grid.addWidget(inp, row, 2)
+        inputs.append(inp)
+
+        cb = QCheckBox()
+        grid.addWidget(cb, row, 3)
+        today_cbs.append(cb)
+
+        # Sync slider ↔ input
+        def _sync_sl(val, _inp=inp): _inp.setText(str(val))
+        def _sync_inp(_text=None, _sl=sl, _inp=inp):
+            try: _sl.blockSignals(True); _sl.setValue(int(float(_inp.text()))); _sl.blockSignals(False)
+            except: pass
+        sl.valueChanged.connect(_sync_sl)
+        inp.textChanged.connect(_sync_inp)
+
+        # Enter on input = move focus to next input
+        def _on_enter(_i=i):
+            # Save current value
+            try: items[_i]["p"] = max(0, min(100, float(inputs[_i].text())))
+            except: pass
+            items[_i]["today"] = today_cbs[_i].isChecked()
+            # Move to next
+            if _i + 1 < len(inputs):
+                inputs[_i + 1].setFocus()
+                inputs[_i + 1].selectAll()
+        inp.returnPressed.connect(_on_enter)
+
+    container.setLayout(grid)
+    scroll.setWidget(container)
+    main_layout.addWidget(scroll)
+
+    # Quick preset row (applies to ALL sources)
     preset_row = QHBoxLayout()
+    preset_row.addWidget(QLabel("Set all:"))
     for val in [10, 25, 50, 75, 90]:
         btn = QPushButton(f"{val}%")
-        btn.clicked.connect(lambda _, v=val: (slider.setValue(v * 100), inp.setText(str(v))))
+        def _set_all(_, v=val):
+            for sl, inp in zip(sliders, inputs):
+                sl.setValue(v); inp.setText(str(v))
+        btn.clicked.connect(_set_all)
         preset_row.addWidget(btn)
-    layout.addLayout(preset_row)
-
-    # Sync slider ↔ input
-    def on_slider(v): inp.setText(f"{v/100:.1f}")
-    def on_text():
-        try: slider.blockSignals(True); slider.setValue(int(float(inp.text()) * 100)); slider.blockSignals(False)
-        except: pass
-    slider.valueChanged.connect(on_slider)
-    inp.textChanged.connect(on_text)
-
-    # Schedule for today checkbox
-    today_cb = QCheckBox("Schedule for today (review immediately)")
-    layout.addWidget(today_cb)
+    main_layout.addLayout(preset_row)
 
     # Buttons
     btn_row = QHBoxLayout()
-    ok = QPushButton("Apply"); cancel = QPushButton("Skip (use default)")
-    btn_row.addStretch(); btn_row.addWidget(ok); btn_row.addWidget(cancel)
-    layout.addLayout(btn_row)
+    apply_btn = QPushButton("Apply All (Ctrl+Enter)")
+    skip_btn = QPushButton("Use Defaults (Esc)")
+    btn_row.addStretch()
+    btn_row.addWidget(apply_btn)
+    btn_row.addWidget(skip_btn)
+    main_layout.addLayout(btn_row)
 
-    result = [False]
+    applied = [False]
 
-    def accept():
-        result[0] = True; dlg.accept()
+    def do_apply():
+        # Collect all values
+        for i in range(len(items)):
+            try: items[i]["p"] = max(0, min(100, float(inputs[i].text())))
+            except: items[i]["p"] = default_p
+            items[i]["today"] = today_cbs[i].isChecked()
+        applied[0] = True
+        dlg.accept()
 
-    ok.clicked.connect(accept)
-    cancel.clicked.connect(dlg.reject)
-    inp.returnPressed.connect(accept)
-    dlg.setLayout(layout)
-    inp.setFocus()
+    def do_skip():
+        applied[0] = False
+        dlg.reject()
+
+    apply_btn.clicked.connect(do_apply)
+    skip_btn.clicked.connect(do_skip)
+
+    # Ctrl+Enter = apply all
+    shortcut = QShortcut(QKeySequence("Ctrl+Return"), dlg)
+    shortcut.activated.connect(do_apply)
+
+    # Esc = skip/abort (QDialog default reject behavior)
+    dlg.rejected.connect(lambda: None)  # Esc triggers reject → do_skip
+
+    dlg.setLayout(main_layout)
+    if inputs: inputs[0].setFocus(); inputs[0].selectAll()
     dlg.exec()
 
-    if result[0]:
-        try: p = max(0.0, min(100.0, float(inp.text())))
-        except: p = cfg("default_priority")
-        due_today = today_cb.isChecked()
-        for card, note in sources:
-            m = get(note)
-            m["p"] = scheduler.clamp_priority(p)
-            m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
-            if due_today:
-                m["due"] = scheduler.today_str()
-                m["iv"] = 1
-            put(note, m); mw.col.update_note(note)
-            _set_review(card, 1, 0 if due_today else 1)
+    # Apply results
+    for i, item in enumerate(items):
+        card, note = item["card"], item["note"]
+        m = get(note)
+        if applied[0]:
+            m["p"] = scheduler.clamp_priority(item["p"])
+        else:
+            m["p"] = scheduler.clamp_priority(default_p)
+        m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
+        if applied[0] and item["today"]:
+            m["due"] = scheduler.today_str(); m["iv"] = 1
+        put(note, m); mw.col.update_note(note)
+        _set_review(card, 1, 0 if (applied[0] and item["today"]) else 1)
 
 
 # ============================================================
