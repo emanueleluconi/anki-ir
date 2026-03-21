@@ -42,13 +42,19 @@ def is_topic(note):
         return False
 
 
+SOURCE_DEFAULT_LENGTH = 100000  # proxy for "long document" — triggers max AF reduction
+
+
 def init_source(note, priority=50.0):
     tl = len(note.fields[0]) if note.fields else 0
+    # Sources use a high default text length so AF gets maximum reduction (×0.75)
+    # This makes sources review more frequently than short extracts
+    effective_tl = max(tl, SOURCE_DEFAULT_LENGTH)
     m = dict(DEFAULT)
     m["p"] = priority
-    m["af"] = scheduler.af_from_priority_and_length(priority, tl)
+    m["af"] = scheduler.af_from_priority_and_length(priority, effective_tl)
     m["due"] = scheduler.date_from_days(1)
-    m["tl"] = tl
+    m["tl"] = effective_tl
     put(note, m)
 
 

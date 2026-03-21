@@ -570,6 +570,7 @@ class IRManager:
         gui_hooks.profile_did_open.append(self._on_profile)
         gui_hooks.reviewer_did_show_question.append(_on_show_question)
         gui_hooks.state_did_change.append(self._on_state_change)
+        gui_hooks.browser_will_show_context_menu.append(_on_browser_context_menu)
         addHook("reviewStateShortcuts", _set_shortcuts)
 
     def _on_profile(self):
@@ -593,6 +594,151 @@ class IRManager:
             mw.col.models.add_field(model, field)
             mw.col.models.save(model)
             tooltip(f"Added '{IR_FIELD}' field to {cfg('topic_note_type')}")
+
+
+# ============================================================
+# Browser context menu: Set Priority, Advance, Later Today
+# ============================================================
+
+def _on_browser_context_menu(browser, menu):
+    """Add IR actions to the browser's right-click context menu."""
+    sel = browser.selectedNotes()
+    if not sel: return
+
+    ir_menu = menu.addMenu("IR")
+
+    a1 = ir_menu.addAction("Set Priority...")
+    a1.triggered.connect(lambda: _browser_set_priority(browser))
+
+    a2 = ir_menu.addAction("Advance to Today")
+    a2.triggered.connect(lambda: _browser_advance_today(browser))
+
+    a3 = ir_menu.addAction("Later Today")
+    a3.triggered.connect(lambda: _browser_later_today(browser))
+
+    a4 = ir_menu.addAction("Reschedule (+days)...")
+    a4.triggered.connect(lambda: _browser_reschedule(browser))
+
+    a5 = ir_menu.addAction("Postpone (1.5x)")
+    a5.triggered.connect(lambda: _browser_postpone(browser))
+
+    a6 = ir_menu.addAction("Done")
+    a6.triggered.connect(lambda: _browser_done(browser))
+
+    a7 = ir_menu.addAction("Forget (park)")
+    a7.triggered.connect(lambda: _browser_forget(browser))
+
+
+def _browser_get_topic_notes(browser):
+    """Get selected notes that are IR topics."""
+    results = []
+    for nid in browser.selectedNotes():
+        note = mw.col.get_note(nid)
+        if is_topic(note):
+            results.append((nid, note))
+    return results
+
+
+def _browser_set_priority(browser):
+    topics = _browser_get_topic_notes(browser)
+    if not topics: tooltip("No IR topics selected."); return
+    # Use first selected topic's current priority as default
+    m0 = get(topics[0][1])
+    result = ask_priority(m0["p"], m0["af"], m0["iv"])
+    if result is None: return
+    for nid, note in topics:
+        m = get(note)
+        m["p"] = scheduler.clamp_priority(result)
+        m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
+        put(note, m); mw.col.update_note(note)
+    tooltip(f"Priority set to {result:.1f}% on {len(topics)} topic(s).")
+
+
+def _browser_advance_today(browser):
+    topics = _browser_get_topic_notes(browser)
+    if not topics: tooltip("No IR topics selected."); return
+    for nid, note in topics:
+        m = get(note)
+        m["due"] = scheduler.today_str()
+        m["p"] = scheduler.clamp_priority(max(0, m["p"] - 10))
+        m["af"] = scheduler.af_from_priority(m["p"])
+        m["iv"] = 1
+        put(note, m); mw.col.update_note(note)
+        # Also sync the card
+        cards = note.cards()
+        if cards: _set_review(cards[0], 1, 0)
+    tooltip(f"Advanced {len(topics)} topic(s) to today.")
+
+
+def _browser_later_today(browser):
+    topics = _browser_get_topic_notes(browser)
+    if not topics: tooltip("No IR topics selected."); return
+    for nid, note in topics:
+        m = get(note)
+        m["due"] = scheduler.today_str()
+        put(note, m); mw.col.update_note(note)
+        cards = note.cards()
+        if cards: _set_review(cards[0], m["iv"], 0)
+    tooltip(f"Scheduled {len(topics)} topic(s) for today.")
+
+
+def _browser_reschedule(browser):
+    topics = _browser_get_topic_notes(browser)
+    if not topics: tooltip("No IR topics selected."); return
+    val, ok = getText("Add days to interval", title="Reschedule", default="3")
+    if not ok or not val: return
+    try: days = int(val)
+    except ValueError: return
+    if days < 1: return
+    for nid, note in topics:
+        m = get(note)
+        r = scheduler.reschedule_increment(m["iv"], days)
+        m["af"] = scheduler.adjust_af_on_reschedule(m["iv"], m["af"], r["iv"])
+        m["p"] = scheduler.adjust_priority_on_interval(m["p"], m["iv"], m["af"], r["iv"])
+        m["due"], m["iv"] = r["due"], r["iv"]
+        put(note, m); mw.col.update_note(note)
+        cards = note.cards()
+        if cards: _set_review(cards[0], m["iv"], days)
+    tooltip(f"Rescheduled {len(topics)} topic(s) +{days}d.")
+
+
+def _browser_postpone(browser):
+    topics = _browser_get_topic_notes(browser)
+    if not topics: tooltip("No IR topics selected."); return
+    for nid, note in topics:
+        m = get(note)
+        r = scheduler.postpone(m["iv"], m["af"])
+        m["due"], m["iv"], m["af"] = r["due"], r["iv"], r["af"]
+        put(note, m); mw.col.update_note(note)
+        cards = note.cards()
+        if cards: _set_review(cards[0], r["iv"], r["iv"])
+    tooltip(f"Postponed {len(topics)} topic(s).")
+
+
+def _browser_done(browser):
+    topics = _browser_get_topic_notes(browser)
+    if not topics: tooltip("No IR topics selected."); return
+    for nid, note in topics:
+        m = get(note); m["st"] = "done"
+        put(note, m); mw.col.update_note(note)
+        cards = note.cards()
+        if cards:
+            c = cards[0]; c.type = 2; c.queue = -2
+            c.due = _col_day() + 9999; mw.col.update_card(c)
+    tooltip(f"Marked {len(topics)} topic(s) as done.")
+
+
+def _browser_forget(browser):
+    topics = _browser_get_topic_notes(browser)
+    if not topics: tooltip("No IR topics selected."); return
+    for nid, note in topics:
+        m = get(note); m["st"] = "forgotten"; m["due"] = None
+        put(note, m); mw.col.update_note(note)
+        cards = note.cards()
+        if cards:
+            c = cards[0]; c.type = 2; c.queue = -2
+            c.due = _col_day() + 9999; mw.col.update_card(c)
+    tooltip(f"Forgot {len(topics)} topic(s).")
 
 
 # Patch answer handling for topic cards
