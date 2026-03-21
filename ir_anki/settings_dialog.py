@@ -13,10 +13,13 @@ def show_settings():
         "initial_interval": 1, "default_priority": 50, "randomization_degree": 5,
         "auto_postpone": True, "postpone_protection": 10, "mercy_days": 14,
         "topic_ratio": 20, "source_tag": "ir::source", "extract_tag": "ir::extract",
-        "key_extract": "x", "key_cloze": "z", "key_priority": "p",
-        "key_priority_up": "9", "key_priority_down": "0", "key_reschedule": "j",
-        "key_execute_rep": "e", "key_postpone": "w", "key_done": "d",
-        "key_forget": "f", "key_edit_last": "Shift+e",
+        "highlight_extract": "#5b9bd5", "highlight_cloze": "#c9a227",
+        "key_extract": "x", "key_cloze": "z", "key_priority": "Shift+p",
+        "key_priority_up": "Alt+Up", "key_priority_down": "Alt+Down",
+        "key_reschedule": "Shift+j", "key_execute_rep": "Shift+r",
+        "key_postpone": "Shift+w", "key_done": "Shift+d", "key_forget": "Shift+f",
+        "key_later_today": "Shift+l", "key_advance_today": "Shift+a",
+        "key_edit_last": "Shift+e", "key_prepare": "Ctrl+Shift+p",
     }
     for k, v in defaults.items():
         if k not in conf: conf[k] = v
@@ -80,9 +83,17 @@ def show_settings():
         ("key_reschedule", "Reschedule (+days)", "str"),
         ("key_execute_rep", "Execute repetition", "str"),
         ("key_postpone", "Postpone (1.5x)", "str"),
+        ("key_later_today", "Later today", "str"),
+        ("key_advance_today", "Advance to today", "str"),
         ("key_done", "Done", "str"),
         ("key_forget", "Forget/park", "str"),
         ("key_edit_last", "Edit last created", "str"),
+        ("key_prepare", "Prepare topics", "str"),
+    ])
+
+    add_group("Highlight Colors", [
+        ("highlight_extract", "Extract highlight", "str"),
+        ("highlight_cloze", "Cloze highlight", "str"),
     ])
 
     # Buttons

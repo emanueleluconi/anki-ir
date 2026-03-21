@@ -1,14 +1,16 @@
 """
-Incremental Reading for Anki.
+Incremental Reading for Anki — SuperMemo 19 topic scheduling.
 
-Topics = review cards with intervals controlled by SM19 via IR-Data field.
-Items = normal Anki cards with FSRS scheduling (untouched).
-Topic cards: type=2, queue=2, ivl/due set by our scheduler.
-When answering a topic, SM19 computes the next interval and we write it directly.
+Topics = review cards (type=2, queue=2) with ivl/due controlled by SM19.
+Items = normal Anki cards with FSRS (completely untouched).
+Studying parent deck interleaves both. Studying Items alone = pure FSRS.
+
+All shortcuts use Shift+ or Alt+ prefixes to avoid Anki default conflicts.
 """
 
 from datetime import date
 from typing import Optional
+import json
 
 from anki.cards import Card
 from anki.hooks import addHook, wrap
@@ -16,7 +18,7 @@ from anki.notes import Note
 from aqt import gui_hooks, mw
 from aqt.qt import QAction, QMenu, QToolBar, QToolButton
 from aqt.reviewer import Reviewer
-from aqt.utils import showInfo, tooltip
+from aqt.utils import showInfo, tooltip, getText
 
 from . import scheduler
 from .ir_meta import get, put, has_field, is_topic, init_extract, init_source, IR_FIELD
@@ -24,19 +26,24 @@ from .queue import build_queue, auto_postpone, mercy, clean_orphans
 from .priority_dialog import ask_priority
 from .settings_dialog import show_settings
 
+_ADDON_NAME = __name__.split(".")[0]
+
 
 def cfg(key):
-    c = mw.addonManager.getConfig(__name__.split(".")[0]) or {}
+    c = mw.addonManager.getConfig(_ADDON_NAME) or {}
     defaults = {
         "topics_deck": "Main::Topics", "items_deck": "Main::Items",
         "topic_note_type": "Extracts", "cloze_note_type": "Cloze",
         "initial_interval": 1, "default_priority": 50, "randomization_degree": 5,
         "auto_postpone": True, "postpone_protection": 10, "mercy_days": 14,
         "topic_ratio": 20, "source_tag": "ir::source", "extract_tag": "ir::extract",
-        "key_extract": "x", "key_cloze": "z", "key_priority": "p",
-        "key_priority_up": "9", "key_priority_down": "0", "key_reschedule": "j",
-        "key_execute_rep": "e", "key_postpone": "w", "key_done": "d",
-        "key_forget": "f", "key_edit_last": "Shift+e",
+        "highlight_extract": "#5b9bd5", "highlight_cloze": "#c9a227",
+        "key_extract": "x", "key_cloze": "z", "key_priority": "Shift+p",
+        "key_priority_up": "Alt+Up", "key_priority_down": "Alt+Down",
+        "key_reschedule": "Shift+j", "key_execute_rep": "Shift+r",
+        "key_postpone": "Shift+w", "key_done": "Shift+d", "key_forget": "Shift+f",
+        "key_later_today": "Shift+l", "key_advance_today": "Shift+a",
+        "key_edit_last": "Shift+e", "key_prepare": "Ctrl+Shift+p",
     }
     return c.get(key, defaults.get(key))
 
@@ -50,69 +57,86 @@ def _is_topic_card(card: Card) -> bool:
     except: return False
 
 
-def _col_day_offset() -> int:
-    """Get Anki's day number for today (days since col creation)."""
-    if not mw.col: return 0
-    return mw.col.sched.today
+def _col_day() -> int:
+    return mw.col.sched.today if mw.col else 0
 
 
-def _set_card_as_review(card: Card, ivl: int, due_in_days: int):
-    """Set a card as a review card due in `due_in_days` from today."""
-    card.type = 2  # review
-    card.queue = 2  # review queue
-    card.ivl = ivl
-    card.due = _col_day_offset() + due_in_days
-    card.left = 0
-    card.lapses = 0
+def _set_review(card: Card, ivl: int, due_days: int):
+    """Set card as review card due in due_days from today."""
+    card.type = 2; card.queue = 2; card.ivl = max(1, ivl)
+    card.due = _col_day() + due_days; card.left = 0
     mw.col.update_card(card)
 
 
-def _bury_card(card: Card):
-    """Push card out of today's queue."""
-    card.queue = -2  # buried manually
-    mw.col.update_card(card)
+def _shelve(card: Card):
+    """Remove card from today's queue (bury)."""
+    card.queue = -2; mw.col.update_card(card)
 
 
 
 # ============================================================
-# Prepare topics: set card.due based on IR-Data scheduling
+# Prepare Topics — the core sync between IR-Data and Anki cards
 # ============================================================
 
 def _prepare_topics():
     """
-    Before studying, sync topic cards' due dates with IR-Data.
-    Due topics → card.due = today (shown in review).
-    Non-due topics → card.due = future day (not shown).
-    This is the closest to SuperMemo: our scheduler controls WHEN topics appear,
-    Anki just serves them as review cards on the scheduled day.
+    Comprehensive topic preparation before review:
+    1. Auto-init IR-Data on any topic notes that don't have it yet
+    2. Auto-postpone overdue low-priority topics
+    3. Clean orphan parent references
+    4. Sync every topic card's Anki due date with IR-Data scheduling
+    5. Respect topic_ratio to limit how many topics show per session
     """
     if not mw.col: return
 
     deck = cfg("topics_deck")
     did = mw.col.decks.id_for_name(deck)
-    if did is None: return
+    if did is None:
+        tooltip(f"Deck '{deck}' not found."); return
 
+    # Step 1: Auto-init any uninitialised topic notes
+    cids = mw.col.find_cards(f'"deck:{deck}"')
+    seen = set()
+    init_count = 0
+    for cid in cids:
+        card = mw.col.get_card(cid)
+        if card.nid in seen: continue
+        seen.add(card.nid)
+        note = card.note()
+        if has_field(note) and not is_topic(note):
+            init_source(note, cfg("default_priority"))
+            mw.col.update_note(note)
+            _set_review(card, 1, 1)
+            init_count += 1
+
+    # Step 2: Auto-postpone
+    postpone_count = 0
     if cfg("auto_postpone"):
-        n = auto_postpone(deck, cfg("postpone_protection"))
-        if n: tooltip(f"IR: postponed {n} topics")
+        postpone_count = auto_postpone(deck, cfg("postpone_protection"))
 
-    clean_orphans(deck)
+    # Step 3: Clean orphans
+    orphan_count = clean_orphans(deck)
 
-    today_iso = date.today().isoformat()
-    today_day = _col_day_offset()
+    # Step 4: Build priority queue and sync card due dates
     queue = build_queue(deck, cfg("randomization_degree"))
     due_set = set(queue)
 
-    # Compute how many topics to show based on ratio
-    # Count items due today in items deck
+    # Compute topic limit from ratio
     items_deck = cfg("items_deck")
-    items_due = len(mw.col.find_cards(f'"deck:{items_deck}" is:due'))
+    try:
+        items_due = len(mw.col.find_cards(f'"deck:{items_deck}" is:due'))
+    except:
+        items_due = 50
     ratio = cfg("topic_ratio") / 100.0
-    max_topics = max(1, round(items_due * ratio / max(0.01, 1 - ratio))) if ratio > 0 else len(queue)
-    topics_to_show = min(len(queue), max_topics)
+    if ratio > 0:
+        max_topics = max(1, round(items_due * ratio / max(0.01, 1 - ratio)))
+    else:
+        max_topics = 0
+    topics_to_show = min(len(queue), max_topics) if max_topics > 0 else len(queue)
 
+    # Step 5: Sync all topic cards
     cids = mw.col.find_cards(f'"deck:{deck}"')
-    seen = set()
+    seen.clear()
     for cid in cids:
         card = mw.col.get_card(cid)
         if card.nid in seen: continue
@@ -121,31 +145,34 @@ def _prepare_topics():
         if not is_topic(note): continue
         m = get(note)
 
+        if m["st"] in ("done", "dismissed", "forgotten"):
+            card.type = 2; card.queue = -2; card.ivl = 9999
+            card.due = _col_day() + 9999; mw.col.update_card(card)
+            continue
+
         if card.nid in due_set:
             pos = queue.index(card.nid)
             if pos < topics_to_show:
-                # Due and within ratio limit: show today as review card
-                # Use position for ordering (lower position = earlier in review)
-                _set_card_as_review(card, max(1, m["iv"]), 0)
+                _set_review(card, max(1, m["iv"]), 0)  # due today
             else:
-                # Due but over ratio: push to tomorrow
-                _set_card_as_review(card, max(1, m["iv"]), 1)
+                _set_review(card, max(1, m["iv"]), 1)  # overflow → tomorrow
         else:
-            # Not due: set due date from IR-Data
+            # Not due: sync from IR-Data
             if m["due"] and m["st"] == "active":
                 try:
-                    due_date = date.fromisoformat(m["due"])
-                    delta = (due_date - date.today()).days
-                    _set_card_as_review(card, max(1, m["iv"]), max(0, delta))
+                    delta = max(1, (date.fromisoformat(m["due"]) - date.today()).days)
                 except:
-                    _set_card_as_review(card, max(1, m["iv"]), 30)
-            elif m["st"] in ("done", "dismissed", "forgotten"):
-                # Inactive: bury indefinitely
-                card.type = 2; card.queue = -2; card.ivl = 9999
-                card.due = today_day + 9999
-                mw.col.update_card(card)
+                    delta = max(1, m["iv"])
+                _set_review(card, max(1, m["iv"]), delta)
+            else:
+                _set_review(card, max(1, m["iv"]), 30)
 
-    tooltip(f"IR: {topics_to_show} topics ready ({len(queue)} due)")
+    parts = []
+    if init_count: parts.append(f"{init_count} initialized")
+    if postpone_count: parts.append(f"{postpone_count} postponed")
+    if orphan_count: parts.append(f"{orphan_count} orphans cleaned")
+    parts.append(f"{topics_to_show}/{len(queue)} topics ready")
+    tooltip(f"IR: {', '.join(parts)}")
 
 
 # ============================================================
@@ -153,79 +180,62 @@ def _prepare_topics():
 # ============================================================
 
 def _custom_answer_card(self, ease, _old):
-    """Intercept answering for topic cards to apply SM19 scheduling."""
     card = self.card
     if not _is_topic_card(card):
-        # Normal item: let FSRS handle it
-        _old(self, ease)
-        return
+        _old(self, ease); return
 
-    # Topic card: apply SM19 scheduling
-    note = card.note()
-    m = get(note)
+    note = card.note(); m = get(note)
     today_iso = date.today().isoformat()
     is_due = not m["due"] or m["due"] <= today_iso
 
     if is_due:
         r = scheduler.execute_repetition(m["iv"], m["af"], m["rc"])
-        m["rc"] = r["rc"]
-        m["lr"] = today_iso
-        m["due"] = r["due"]
-        m["iv"] = r["iv"]
-        m["af"] = r["af"]
+        m["rc"], m["lr"] = r["rc"], today_iso
+        m["due"], m["iv"], m["af"] = r["due"], r["iv"], r["af"]
     else:
         r = scheduler.mid_interval_rep(m["af"], m["rc"])
-        m["rc"] = r["rc"]
-        m["af"] = r["af"]
+        m["rc"], m["af"] = r["rc"], r["af"]
 
-    put(note, m)
-    mw.col.update_note(note)
+    put(note, m); mw.col.update_note(note)
 
-    # Set card's Anki-level scheduling to match
     try:
-        due_date = date.fromisoformat(m["due"]) if m["due"] else date.today()
-        delta = max(1, (due_date - date.today()).days)
-    except:
-        delta = max(1, m["iv"])
-
-    _set_card_as_review(card, m["iv"], delta)
-
-    # Move to next card (don't call _old which would apply FSRS)
+        delta = max(1, (date.fromisoformat(m["due"]) - date.today()).days) if m["due"] else m["iv"]
+    except: delta = m["iv"]
+    _set_review(card, m["iv"], delta)
     self.nextCard()
 
 
 def _custom_answer_buttons(self, _old):
-    if _is_topic_card(self.card):
-        return ((1, "Next"),)
+    if _is_topic_card(self.card): return ((1, "Next"),)
     return _old(self)
 
 
 def _custom_button_time(self, i, v3_labels, _old):
     try:
-        if _is_topic_card(mw.reviewer.card):
-            return "<div class=spacer></div>"
+        if _is_topic_card(mw.reviewer.card): return "<div class=spacer></div>"
     except: pass
     return _old(self, i, v3_labels)
 
 
 
 # ============================================================
-# IR Toolbar (visible during review when topic card is shown)
+# Toolbar
 # ============================================================
 
 def _setup_toolbar():
     global _ir_toolbar
     if _ir_toolbar: return
-    _ir_toolbar = QToolBar("IR Commands", mw)
-    _ir_toolbar.setMovable(False)
-    _ir_toolbar.setVisible(False)
+    _ir_toolbar = QToolBar("IR", mw)
+    _ir_toolbar.setMovable(False); _ir_toolbar.setVisible(False)
     for label, fn in [
-        ("Extract[X]", _cmd_extract), ("Cloze[Z]", _cmd_cloze),
-        ("Priority[P]", _cmd_priority), ("P+[9]", lambda: _cmd_quick_priority(-5)),
-        ("P-[0]", lambda: _cmd_quick_priority(5)), ("Resched[J]", _cmd_reschedule),
-        ("ExecRep[E]", _cmd_execute_rep), ("Postpone[W]", _cmd_postpone),
-        ("Done[D]", _cmd_done), ("Forget[F]", _cmd_forget),
-        ("EditLast[Shift+E]", _cmd_edit_last),
+        ("Extract", _cmd_extract), ("Cloze", _cmd_cloze),
+        ("Priority", _cmd_priority), ("P+", lambda: _cmd_quick_priority(-5)),
+        ("P-", lambda: _cmd_quick_priority(5)),
+        ("Resched", _cmd_reschedule), ("ExecRep", _cmd_execute_rep),
+        ("Postpone", _cmd_postpone), ("Later", _cmd_later_today),
+        ("Advance", _cmd_advance_today),
+        ("Done", _cmd_done), ("Forget", _cmd_forget),
+        ("EditLast", _cmd_edit_last),
     ]:
         btn = QToolButton(); btn.setText(label); btn.clicked.connect(fn)
         _ir_toolbar.addWidget(btn)
@@ -233,11 +243,10 @@ def _setup_toolbar():
 
 
 def _on_show_question(card: Card):
-    if _ir_toolbar:
-        _ir_toolbar.setVisible(_is_topic_card(card))
+    if _ir_toolbar: _ir_toolbar.setVisible(_is_topic_card(card))
     if _is_topic_card(card):
         m = get(card.note())
-        tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f}", period=2000)
+        tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
 
 
 def _on_review_end():
@@ -254,9 +263,13 @@ def _set_shortcuts(shortcuts):
         (cfg("key_priority"), _cmd_priority),
         (cfg("key_priority_up"), lambda: _cmd_quick_priority(-5)),
         (cfg("key_priority_down"), lambda: _cmd_quick_priority(5)),
-        (cfg("key_reschedule"), _cmd_reschedule), (cfg("key_execute_rep"), _cmd_execute_rep),
-        (cfg("key_postpone"), _cmd_postpone), (cfg("key_done"), _cmd_done),
-        (cfg("key_forget"), _cmd_forget), (cfg("key_edit_last"), _cmd_edit_last),
+        (cfg("key_reschedule"), _cmd_reschedule),
+        (cfg("key_execute_rep"), _cmd_execute_rep),
+        (cfg("key_postpone"), _cmd_postpone),
+        (cfg("key_later_today"), _cmd_later_today),
+        (cfg("key_advance_today"), _cmd_advance_today),
+        (cfg("key_done"), _cmd_done), (cfg("key_forget"), _cmd_forget),
+        (cfg("key_edit_last"), _cmd_edit_last),
     ])
 
 
@@ -299,18 +312,17 @@ def _do_extract(text):
     mw.col.addNote(nn)
     _last_created_nid = nn.id
 
-    # Set the new card as a review card due tomorrow
     new_cards = nn.cards()
-    if new_cards:
-        _set_card_as_review(new_cards[0], 1, 1)
+    if new_cards: _set_review(new_cards[0], 1, 1)
 
-    # Deprioritize parent (SM19)
+    # SM19: deprioritize parent after extraction
     if pm:
         pm["af"] = scheduler.parent_af_after_extract(pm["af"])
         pm["p"] = scheduler.parent_priority_after_extract(pm["p"])
         put(parent, pm); mw.col.update_note(parent)
 
-    mw.web.eval("(function(){var s=window.getSelection();if(s.rangeCount>0){var r=s.getRangeAt(0);var sp=document.createElement('span');sp.style.backgroundColor='#a8d8ea';r.surroundContents(sp);s.removeAllRanges();}})();")
+    color = cfg("highlight_extract")
+    mw.web.eval(f"(function(){{var s=window.getSelection();if(s.rangeCount>0){{var r=s.getRangeAt(0);var sp=document.createElement('span');sp.style.backgroundColor='{color}';sp.style.color='#fff';r.surroundContents(sp);s.removeAllRanges();}}}})();")
     tooltip("Extract created")
 
 
@@ -331,7 +343,6 @@ def _cmd_cloze():
 
 def _do_cloze(result):
     global _last_created_nid
-    import json
     try: data = json.loads(result) if isinstance(result, str) else result
     except: tooltip("Select text first."); return
     if not data or "err" in data: tooltip("Select text first."); return
@@ -359,13 +370,12 @@ def _do_cloze(result):
     mw.col.addNote(nn)
     _last_created_nid = nn.id
 
-    # Bury the new cloze card so it shows tomorrow, not today
-    new_cards = nn.cards()
-    for nc in new_cards:
-        _bury_card(nc)
+    # Bury new cloze so it appears tomorrow via FSRS, not today
+    for nc in nn.cards(): _shelve(nc)
 
-    mw.web.eval("(function(){var s=window.getSelection();if(s.rangeCount>0){var r=s.getRangeAt(0);var sp=document.createElement('span');sp.style.backgroundColor='#ffe0b2';r.surroundContents(sp);s.removeAllRanges();}})();")
-    tooltip("Cloze created (buried for tomorrow)")
+    color = cfg("highlight_cloze")
+    mw.web.eval(f"(function(){{var s=window.getSelection();if(s.rangeCount>0){{var r=s.getRangeAt(0);var sp=document.createElement('span');sp.style.backgroundColor='{color}';sp.style.color='#fff';r.surroundContents(sp);s.removeAllRanges();}}}})();")
+    tooltip("Cloze created (tomorrow)")
 
 
 
@@ -390,11 +400,11 @@ def _cmd_quick_priority(delta):
     tooltip(f"Priority: {m['p']:.1f}%")
 
 def _cmd_reschedule():
+    """SM Ctrl+J: add days to interval. Last review unchanged."""
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
     note = card.note(); m = get(note)
-    from aqt.utils import getText
-    val, ok = getText(f"Add days (interval: {m['iv']}d)", title="Reschedule", default="3")
+    val, ok = getText(f"Add days to interval (current: {m['iv']}d)", title="Reschedule (+days)", default="3")
     if not ok or not val: return
     try: days = int(val)
     except ValueError: return
@@ -403,16 +413,17 @@ def _cmd_reschedule():
     m["af"] = scheduler.adjust_af_on_reschedule(m["iv"], m["af"], r["iv"])
     m["p"] = scheduler.adjust_priority_on_interval(m["p"], m["iv"], m["af"], r["iv"])
     m["due"], m["iv"] = r["due"], r["iv"]
+    # Note: lr (last review) NOT updated — this is the key SM Ctrl+J behavior
     put(note, m); mw.col.update_note(note)
-    _set_card_as_review(card, m["iv"], days)
-    tooltip(f"+{days}d → {r['iv']}d"); mw.reviewer.nextCard()
+    _set_review(card, m["iv"], days)
+    tooltip(f"Reschedule: +{days}d → interval {r['iv']}d"); mw.reviewer.nextCard()
 
 def _cmd_execute_rep():
+    """SM Ctrl+Shift+R: set new interval from today. Last review = today."""
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
     note = card.note(); m = get(note)
-    from aqt.utils import getText
-    val, ok = getText(f"Set interval (current: {m['iv']}d)", title="Execute Rep", default=str(m["iv"]))
+    val, ok = getText(f"Set new interval from today (current: {m['iv']}d)", title="Execute Repetition", default=str(m["iv"]))
     if not ok or not val: return
     try: days = int(val)
     except ValueError: return
@@ -422,25 +433,52 @@ def _cmd_execute_rep():
     m["due"] = scheduler.date_from_days(days); m["iv"] = days
     m["lr"] = scheduler.today_str(); m["rc"] += 1
     put(note, m); mw.col.update_note(note)
-    _set_card_as_review(card, days, days)
-    tooltip(f"Exec rep: {days}d"); mw.reviewer.nextCard()
+    _set_review(card, days, days)
+    tooltip(f"Execute rep: interval={days}d, AF={m['af']:.2f}"); mw.reviewer.nextCard()
 
 def _cmd_postpone():
+    """SM Postpone: multiply interval by 1.5x."""
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
     note = card.note(); m = get(note)
     r = scheduler.postpone(m["iv"], m["af"])
     m["due"], m["iv"], m["af"] = r["due"], r["iv"], r["af"]
     put(note, m); mw.col.update_note(note)
-    _set_card_as_review(card, r["iv"], r["iv"])
+    _set_review(card, r["iv"], r["iv"])
     tooltip(f"Postponed: {r['iv']}d"); mw.reviewer.nextCard()
+
+def _cmd_later_today():
+    """SM Ctrl+Shift+J: due=today, interval unchanged."""
+    card = mw.reviewer.card
+    if not card or not _is_topic_card(card): return
+    note = card.note(); m = get(note)
+    m["due"] = scheduler.today_str()
+    # Interval, AF, priority all stay unchanged
+    put(note, m); mw.col.update_note(note)
+    _set_review(card, m["iv"], 0)
+    tooltip("Later today (interval unchanged)")
+
+def _cmd_advance_today():
+    """SM Advance: move to today + boost priority by 10%."""
+    card = mw.reviewer.card
+    if not card or not _is_topic_card(card):
+        # Also works outside review: advance by note ID from browser
+        return
+    note = card.note(); m = get(note)
+    m["due"] = scheduler.today_str()
+    m["p"] = scheduler.clamp_priority(max(0, m["p"] - 10))
+    m["af"] = scheduler.af_from_priority(m["p"])
+    m["iv"] = 1
+    put(note, m); mw.col.update_note(note)
+    _set_review(card, 1, 0)
+    tooltip(f"Advanced to today. Priority: {m['p']:.1f}%")
 
 def _cmd_done():
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
     note = card.note(); m = get(note); m["st"] = "done"
     put(note, m); mw.col.update_note(note)
-    card.type = 2; card.queue = -2; card.due = _col_day_offset() + 9999
+    card.type = 2; card.queue = -2; card.due = _col_day() + 9999
     mw.col.update_card(card)
     tooltip("Done"); mw.reviewer.nextCard()
 
@@ -449,7 +487,7 @@ def _cmd_forget():
     if not card or not _is_topic_card(card): return
     note = card.note(); m = get(note); m["st"] = "forgotten"; m["due"] = None
     put(note, m); mw.col.update_note(note)
-    card.type = 2; card.queue = -2; card.due = _col_day_offset() + 9999
+    card.type = 2; card.queue = -2; card.due = _col_day() + 9999
     mw.col.update_card(card)
     tooltip("Forgotten"); mw.reviewer.nextCard()
 
@@ -458,12 +496,12 @@ def _cmd_edit_last():
     if not _last_created_nid: tooltip("No recent card."); return
     try:
         from aqt.browser.browser import Browser
-        browser = Browser(mw)
-        browser.form.searchEdit.lineEdit().setText(f"nid:{_last_created_nid}")
-        browser.onSearchActivated()
-        browser.show()
+        b = Browser(mw)
+        b.form.searchEdit.lineEdit().setText(f"nid:{_last_created_nid}")
+        b.onSearchActivated(); b.show()
     except Exception as ex:
         tooltip(f"Error: {ex}")
+
 
 
 # ============================================================
@@ -473,12 +511,15 @@ def _cmd_edit_last():
 def _add_menu():
     menu = QMenu("IR", mw)
     mw.form.menubar.addMenu(menu)
-    def _a(name, fn):
-        a = QAction(name, mw); a.triggered.connect(fn); menu.addAction(a)
+    def _a(name, fn, shortcut=None):
+        a = QAction(name, mw)
+        if shortcut: a.setShortcut(shortcut)
+        a.triggered.connect(fn); menu.addAction(a)
+
     _a("Settings...", show_settings)
     menu.addSeparator()
-    _a("Prepare Topics", _prepare_topics)
-    _a("Mercy (Spread Overdue)", lambda: showInfo(f"Mercy: {mercy(cfg('topics_deck'), cfg('mercy_days'))} topics."))
+    _a("Prepare Topics", _prepare_topics, cfg("key_prepare"))
+    _a("Mercy (Spread Overdue)", lambda: showInfo(f"Mercy: {mercy(cfg('topics_deck'), cfg('mercy_days'))} topics spread."))
     _a("Auto-Postpone Now", lambda: showInfo(f"Postponed {auto_postpone(cfg('topics_deck'), cfg('postpone_protection'))} topics."))
     _a("Clean Orphans", lambda: showInfo(f"Cleaned {clean_orphans(cfg('topics_deck'))} orphans."))
     menu.addSeparator()
@@ -500,8 +541,7 @@ def _init_topics():
         if is_topic(note): continue
         init_source(note, cfg("default_priority"))
         mw.col.update_note(note)
-        # Set card as review due tomorrow
-        _set_card_as_review(card, 1, 1)
+        _set_review(card, 1, 1)
         n += 1
     showInfo(f"Initialized {n} topics.")
 
@@ -518,7 +558,7 @@ def _show_stats():
             if m.get("due") and m["due"] <= today: due += 1
         elif m["st"] == "done": done += 1
         elif m["st"] == "forgotten": forgotten += 1
-    showInfo(f"Topics: {total}\nActive: {active}\nDue: {due}\nDone: {done}\nForgotten: {forgotten}")
+    showInfo(f"IR Queue Stats\n\nTopics: {total}\nActive: {active}\nDue today: {due}\nDone: {done}\nForgotten: {forgotten}")
 
 
 # ============================================================
@@ -537,13 +577,11 @@ class IRManager:
         self._ensure_field()
         _add_menu()
         _setup_toolbar()
-        mw.addonManager.setConfigAction(__name__.split(".")[0], show_settings)
+        mw.addonManager.setConfigAction(_ADDON_NAME, show_settings)
 
     def _on_state_change(self, new_state, old_state):
-        if new_state == "review":
-            _prepare_topics()
-        if old_state == "review":
-            _on_review_end()
+        if new_state == "review": _prepare_topics()
+        if old_state == "review": _on_review_end()
 
     def _ensure_field(self):
         if not mw.col: return
