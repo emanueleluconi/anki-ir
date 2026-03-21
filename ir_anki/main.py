@@ -206,7 +206,10 @@ def _custom_answer_card(self, ease, _old):
 
 
 def _custom_answer_buttons(self, _old):
-    if _is_topic_card(self.card): return ((1, "Next"),)
+    if _is_topic_card(self.card):
+        m = get(self.card.note())
+        next_iv = scheduler.compute_next_interval(max(1, m["iv"]), m["af"])
+        return ((1, f"Next ({next_iv}d)"),)
     return _old(self)
 
 
@@ -228,14 +231,19 @@ def _setup_toolbar():
     _ir_toolbar = QToolBar("IR", mw)
     _ir_toolbar.setMovable(False); _ir_toolbar.setVisible(False)
     for label, fn in [
-        ("Extract", _cmd_extract), ("Cloze", _cmd_cloze),
-        ("Priority", _cmd_priority), ("P+", lambda: _cmd_quick_priority(-5)),
-        ("P-", lambda: _cmd_quick_priority(5)),
-        ("Resched", _cmd_reschedule), ("ExecRep", _cmd_execute_rep),
-        ("Postpone", _cmd_postpone), ("Later", _cmd_later_today),
-        ("Advance", _cmd_advance_today),
-        ("Done", _cmd_done), ("Forget", _cmd_forget),
-        ("EditLast", _cmd_edit_last),
+        (f"Extract [{cfg('key_extract')}]", _cmd_extract),
+        (f"Cloze [{cfg('key_cloze')}]", _cmd_cloze),
+        (f"Priority [{cfg('key_priority')}]", _cmd_priority),
+        (f"P+ [{cfg('key_priority_up')}]", lambda: _cmd_quick_priority(-5)),
+        (f"P- [{cfg('key_priority_down')}]", lambda: _cmd_quick_priority(5)),
+        (f"Resched [{cfg('key_reschedule')}]", _cmd_reschedule),
+        (f"ExecRep [{cfg('key_execute_rep')}]", _cmd_execute_rep),
+        (f"Postpone [{cfg('key_postpone')}]", _cmd_postpone),
+        (f"Later [{cfg('key_later_today')}]", _cmd_later_today),
+        (f"Advance [{cfg('key_advance_today')}]", _cmd_advance_today),
+        (f"Done [{cfg('key_done')}]", _cmd_done),
+        (f"Forget [{cfg('key_forget')}]", _cmd_forget),
+        (f"EditLast [{cfg('key_edit_last')}]", _cmd_edit_last),
     ]:
         btn = QToolButton(); btn.setText(label); btn.clicked.connect(fn)
         _ir_toolbar.addWidget(btn)
@@ -322,7 +330,16 @@ def _do_extract(text):
         put(parent, pm); mw.col.update_note(parent)
 
     color = cfg("highlight_extract")
-    mw.web.eval(f"(function(){{var s=window.getSelection();if(s.rangeCount>0){{var r=s.getRangeAt(0);var sp=document.createElement('span');sp.style.backgroundColor='{color}';sp.style.color='#fff';r.surroundContents(sp);s.removeAllRanges();}}}})();")
+    mw.web.eval(f"""(function(){{
+        var s=window.getSelection();if(s.rangeCount>0){{
+            var r=s.getRangeAt(0);var sp=document.createElement('span');
+            sp.style.backgroundColor='{color}';sp.style.color='#fff';
+            r.surroundContents(sp);s.removeAllRanges();
+        }}
+        // Save modified HTML back to note
+        var el=document.querySelector('.ir-text')||document.querySelector('.card');
+        if(el){{pycmd('ir_save_html:'+el.innerHTML);}}
+    }})();""")
     tooltip("Extract created")
 
 
@@ -374,7 +391,15 @@ def _do_cloze(result):
     for nc in nn.cards(): _shelve(nc)
 
     color = cfg("highlight_cloze")
-    mw.web.eval(f"(function(){{var s=window.getSelection();if(s.rangeCount>0){{var r=s.getRangeAt(0);var sp=document.createElement('span');sp.style.backgroundColor='{color}';sp.style.color='#fff';r.surroundContents(sp);s.removeAllRanges();}}}})();")
+    mw.web.eval(f"""(function(){{
+        var s=window.getSelection();if(s.rangeCount>0){{
+            var r=s.getRangeAt(0);var sp=document.createElement('span');
+            sp.style.backgroundColor='{color}';sp.style.color='#fff';
+            r.surroundContents(sp);s.removeAllRanges();
+        }}
+        var el=document.querySelector('.ir-text')||document.querySelector('.card');
+        if(el){{pycmd('ir_save_html:'+el.innerHTML);}}
+    }})();""")
     tooltip("Cloze created (tomorrow)")
 
 
@@ -478,9 +503,10 @@ def _cmd_done():
     if not card or not _is_topic_card(card): return
     note = card.note(); m = get(note); m["st"] = "done"
     put(note, m); mw.col.update_note(note)
-    card.type = 2; card.queue = -2; card.due = _col_day() + 9999
-    mw.col.update_card(card)
-    tooltip("Done"); mw.reviewer.nextCard()
+    # Suspend all cards of this note (Anki suspend = permanently out of review)
+    cids = [c.id for c in note.cards()]
+    mw.col.sched.suspend_cards(cids)
+    tooltip("Done (suspended)"); mw.reviewer.nextCard()
 
 def _cmd_forget():
     card = mw.reviewer.card
@@ -571,7 +597,23 @@ class IRManager:
         gui_hooks.reviewer_did_show_question.append(_on_show_question)
         gui_hooks.state_did_change.append(self._on_state_change)
         gui_hooks.browser_will_show_context_menu.append(_on_browser_context_menu)
+        gui_hooks.webview_did_receive_js_message.append(self._on_js_message)
         addHook("reviewStateShortcuts", _set_shortcuts)
+
+    def _on_js_message(self, handled, message, context):
+        """Handle pycmd messages from the webview (e.g., saving highlights)."""
+        if not isinstance(context, Reviewer): return handled
+        if not message.startswith("ir_save_html:"): return handled
+        html = message[len("ir_save_html:"):]
+        card = mw.reviewer.card
+        if card:
+            note = card.note()
+            # Save the modified HTML to the Text field
+            fnames = [f["name"] for f in note.note_type()["flds"]]
+            if "Text" in fnames:
+                note["Text"] = html
+                mw.col.update_note(note)
+        return (True, None)
 
     def _on_profile(self):
         if not mw.col: return
@@ -721,11 +763,9 @@ def _browser_done(browser):
     for nid, note in topics:
         m = get(note); m["st"] = "done"
         put(note, m); mw.col.update_note(note)
-        cards = note.cards()
-        if cards:
-            c = cards[0]; c.type = 2; c.queue = -2
-            c.due = _col_day() + 9999; mw.col.update_card(c)
-    tooltip(f"Marked {len(topics)} topic(s) as done.")
+        cids = [c.id for c in note.cards()]
+        mw.col.sched.suspend_cards(cids)
+    tooltip(f"Done (suspended) {len(topics)} topic(s).")
 
 
 def _browser_forget(browser):
