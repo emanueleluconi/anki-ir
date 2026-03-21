@@ -549,7 +549,6 @@ def _add_menu():
     _a("Auto-Postpone Now", lambda: showInfo(f"Postponed {auto_postpone(cfg('topics_deck'), cfg('postpone_protection'))} topics."))
     _a("Clean Orphans", lambda: showInfo(f"Cleaned {clean_orphans(cfg('topics_deck'))} orphans."))
     menu.addSeparator()
-    _a("Init IR Data on Topics", _init_topics)
     _a("Queue Stats", _show_stats)
 
 
