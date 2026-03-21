@@ -74,6 +74,91 @@ def _shelve(card: Card):
 
 
 
+def _ask_new_source_priority(sources):
+    """Show dialog for newly imported sources to set priority and optionally schedule today."""
+    from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+                         QSlider, QPushButton, QCheckBox, QListWidget, Qt)
+
+    dlg = QDialog(mw)
+    dlg.setWindowTitle(f"New Sources ({len(sources)})")
+    dlg.setMinimumWidth(420)
+    layout = QVBoxLayout()
+
+    layout.addWidget(QLabel(f"{len(sources)} new source(s) imported. Set priority:"))
+
+    # List the source names
+    lst = QListWidget()
+    for _, note in sources:
+        title = note.fields[0][:80] if note.fields else "?"
+        lst.addItem(title)
+    lst.setMaximumHeight(120)
+    layout.addWidget(lst)
+
+    # Priority slider + input
+    slider = QSlider(Qt.Orientation.Horizontal)
+    slider.setRange(0, 10000); slider.setValue(int(cfg("default_priority") * 100))
+    layout.addWidget(slider)
+
+    row = QHBoxLayout()
+    row.addWidget(QLabel("Priority:"))
+    inp = QLineEdit(str(cfg("default_priority")))
+    inp.selectAll()
+    row.addWidget(inp)
+    layout.addLayout(row)
+
+    # Quick presets
+    preset_row = QHBoxLayout()
+    for val in [10, 25, 50, 75, 90]:
+        btn = QPushButton(f"{val}%")
+        btn.clicked.connect(lambda _, v=val: (slider.setValue(v * 100), inp.setText(str(v))))
+        preset_row.addWidget(btn)
+    layout.addLayout(preset_row)
+
+    # Sync slider ↔ input
+    def on_slider(v): inp.setText(f"{v/100:.1f}")
+    def on_text():
+        try: slider.blockSignals(True); slider.setValue(int(float(inp.text()) * 100)); slider.blockSignals(False)
+        except: pass
+    slider.valueChanged.connect(on_slider)
+    inp.textChanged.connect(on_text)
+
+    # Schedule for today checkbox
+    today_cb = QCheckBox("Schedule for today (review immediately)")
+    layout.addWidget(today_cb)
+
+    # Buttons
+    btn_row = QHBoxLayout()
+    ok = QPushButton("Apply"); cancel = QPushButton("Skip (use default)")
+    btn_row.addStretch(); btn_row.addWidget(ok); btn_row.addWidget(cancel)
+    layout.addLayout(btn_row)
+
+    result = [False]
+
+    def accept():
+        result[0] = True; dlg.accept()
+
+    ok.clicked.connect(accept)
+    cancel.clicked.connect(dlg.reject)
+    inp.returnPressed.connect(accept)
+    dlg.setLayout(layout)
+    inp.setFocus()
+    dlg.exec()
+
+    if result[0]:
+        try: p = max(0.0, min(100.0, float(inp.text())))
+        except: p = cfg("default_priority")
+        due_today = today_cb.isChecked()
+        for card, note in sources:
+            m = get(note)
+            m["p"] = scheduler.clamp_priority(p)
+            m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
+            if due_today:
+                m["due"] = scheduler.today_str()
+                m["iv"] = 1
+            put(note, m); mw.col.update_note(note)
+            _set_review(card, 1, 0 if due_today else 1)
+
+
 # ============================================================
 # Prepare Topics — the core sync between IR-Data and Anki cards
 # ============================================================
@@ -95,19 +180,68 @@ def _prepare_topics():
         tooltip(f"Deck '{deck}' not found."); return
 
     # Step 1: Auto-init any uninitialised topic notes
+    # Sources: init at default priority (user can adjust later)
+    # Extracts: auto-inherit priority from parent source (matched by Reference field)
     cids = mw.col.find_cards(f'"deck:{deck}"')
     seen = set()
+    new_sources = []  # (card, note) pairs for new sources
     init_count = 0
+    source_tag = cfg("source_tag")
+    extract_tag = cfg("extract_tag")
+
+    # First pass: build a map of Reference → source priority for parent matching
+    ref_to_priority = {}
     for cid in cids:
         card = mw.col.get_card(cid)
         if card.nid in seen: continue
         seen.add(card.nid)
         note = card.note()
-        if has_field(note) and not is_topic(note):
-            init_source(note, cfg("default_priority"))
+        if is_topic(note):
+            m = get(note)
+            fnames = [f["name"] for f in note.note_type()["flds"]]
+            if "Reference" in fnames:
+                ref = note["Reference"].strip()
+                if ref and m["st"] == "active":
+                    # Keep the lowest (best) priority for each reference
+                    if ref not in ref_to_priority or m["p"] < ref_to_priority[ref]:
+                        ref_to_priority[ref] = m["p"]
+
+    # Second pass: init uninitialised notes
+    seen.clear()
+    for cid in cids:
+        card = mw.col.get_card(cid)
+        if card.nid in seen: continue
+        seen.add(card.nid)
+        note = card.note()
+        if not has_field(note) or is_topic(note): continue
+
+        is_extract = extract_tag in note.tags
+        is_source_note = source_tag in note.tags
+
+        if is_extract:
+            # Extract from Zotero: inherit priority from parent source
+            fnames = [f["name"] for f in note.note_type()["flds"]]
+            parent_p = cfg("default_priority")
+            if "Reference" in fnames:
+                ref = note["Reference"].strip()
+                if ref and ref in ref_to_priority:
+                    parent_p = ref_to_priority[ref]
+            text_len = len(note.fields[0]) if note.fields else 0
+            init_extract(note, 0, parent_p, text_len)
             mw.col.update_note(note)
             _set_review(card, 1, 1)
             init_count += 1
+        else:
+            # Source (or untagged): collect for batch priority dialog
+            init_source(note, cfg("default_priority"))
+            mw.col.update_note(note)
+            _set_review(card, 1, 1)
+            new_sources.append((card, note))
+            init_count += 1
+
+    # If there are new sources, show a dialog to set priority and schedule
+    if new_sources:
+        _ask_new_source_priority(new_sources)
 
     # Step 2: Auto-postpone
     postpone_count = 0

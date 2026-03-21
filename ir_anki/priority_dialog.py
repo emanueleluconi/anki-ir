@@ -47,6 +47,14 @@ def ask_priority(current: float, af: float, interval: int) -> float | None:
     slider.valueChanged.connect(on_slider)
     inp.textChanged.connect(on_text)
 
+    # Quick presets
+    preset_row = QHBoxLayout()
+    for val in [10, 25, 50, 75, 90]:
+        btn = QPushButton(f"{val}%")
+        btn.clicked.connect(lambda _, v=val: (slider.setValue(v * 100), inp.setText(str(v))))
+        preset_row.addWidget(btn)
+    layout.addLayout(preset_row)
+
     def accept():
         try:
             result[0] = max(0.0, min(100.0, float(inp.text())))
