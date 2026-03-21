@@ -421,12 +421,21 @@ def _set_shortcuts(shortcuts):
 
 def _cmd_extract():
     if mw.state != "review": return
-    mw.web.evalWithCallback("window.getSelection().toString()", _do_extract)
+    # Get HTML of selection (preserves math, formatting, etc.)
+    js = """(function(){
+        var sel=window.getSelection();
+        if(!sel||sel.isCollapsed) return '';
+        var range=sel.getRangeAt(0);
+        var div=document.createElement('div');
+        div.appendChild(range.cloneContents());
+        return div.innerHTML;
+    })();"""
+    mw.web.evalWithCallback(js, _do_extract)
 
-def _do_extract(text):
+def _do_extract(html):
     global _last_created_nid
-    if not text or not text.strip(): tooltip("Select text first."); return
-    text = text.strip()
+    if not html or not html.strip(): tooltip("Select text first."); return
+    html = html.strip()
     card = mw.reviewer.card
     if not card: return
     parent = card.note()
@@ -436,8 +445,8 @@ def _do_extract(text):
     if not model: showInfo(f"Note type '{cfg('topic_note_type')}' not found."); return
     nn = Note(mw.col, model)
     fnames = [f["name"] for f in model["flds"]]
-    if "Text" in fnames: nn["Text"] = text
-    elif fnames: nn.fields[0] = text
+    if "Text" in fnames: nn["Text"] = html
+    elif fnames: nn.fields[0] = html
     for f in ("Reference", "Back Extra"):
         if f in fnames:
             try: nn[f] = parent[f]
@@ -449,7 +458,10 @@ def _do_extract(text):
 
     did = mw.col.decks.id_for_name(cfg("topics_deck")) or card.did
     pp = pm["p"] if pm else cfg("default_priority")
-    init_extract(nn, parent.id, pp, len(text))
+    # Use plain text length for AF calculation (strip HTML tags)
+    import re as _re
+    plain_len = len(_re.sub(r'<[^>]+>', '', html))
+    init_extract(nn, parent.id, pp, plain_len)
     nn.note_type()["did"] = did
     mw.col.addNote(nn)
     _last_created_nid = nn.id
@@ -479,17 +491,34 @@ def _do_extract(text):
 
 def _cmd_cloze():
     if mw.state != "review": return
+    # Get both HTML and plain text of selection + containing line
     js = """(function(){
         var sel=window.getSelection();
         if(!sel||sel.isCollapsed)return JSON.stringify({err:1});
-        var st=sel.toString(),r=sel.getRangeAt(0),n=r.startContainer;
-        var b=n.nodeType===3?n.parentElement:n;
-        while(b&&b!==document.body){var t=b.tagName?b.tagName.toLowerCase():"";
-        if(["p","div","li","td","th","blockquote","h1","h2","h3","h4","h5","h6"].indexOf(t)>=0)break;b=b.parentElement;}
-        var ft=b?b.innerText:st,ls=ft.split("\\n"),bl=ls[0]||ft;
-        var sub=st.substring(0,Math.min(20,st.length));
-        for(var i=0;i<ls.length;i++){if(ls[i].indexOf(sub)>=0){bl=ls[i];break;}}
-        return JSON.stringify({sel:st.trim(),line:bl.trim()});})();"""
+        var range=sel.getRangeAt(0);
+        // Get HTML of selection
+        var div=document.createElement('div');
+        div.appendChild(range.cloneContents());
+        var selHtml=div.innerHTML;
+        var selText=sel.toString().trim();
+        // Find the containing block element for the full line
+        var node=range.startContainer;
+        var block=node.nodeType===3?node.parentElement:node;
+        while(block&&block!==document.body){
+            var tag=block.tagName?block.tagName.toLowerCase():"";
+            if(["p","div","li","td","th","blockquote","h1","h2","h3","h4","h5","h6"].indexOf(tag)>=0)break;
+            block=block.parentElement;
+        }
+        // Get HTML of the full line/block
+        var lineHtml=block?block.innerHTML:selHtml;
+        var lineText=block?block.innerText:selText;
+        // Find the best matching line in plain text (for multi-line blocks)
+        var lines=lineText.split("\\n");
+        var bestLine=lines[0]||lineText;
+        var sub=selText.substring(0,Math.min(20,selText.length));
+        for(var i=0;i<lines.length;i++){if(lines[i].indexOf(sub)>=0){bestLine=lines[i];break;}}
+        return JSON.stringify({selHtml:selHtml,selText:selText,lineHtml:lineHtml,lineText:bestLine.trim()});
+    })();"""
     mw.web.evalWithCallback(js, _do_cloze)
 
 def _do_cloze(result):
@@ -497,10 +526,21 @@ def _do_cloze(result):
     try: data = json.loads(result) if isinstance(result, str) else result
     except: tooltip("Select text first."); return
     if not data or "err" in data: tooltip("Select text first."); return
-    sel = data.get("sel", "").strip()
-    line = data.get("line", "").strip()
-    if not sel: tooltip("Select text first."); return
-    cloze_text = line.replace(sel, "{{c1::" + sel + "}}", 1) if sel in line else "{{c1::" + sel + "}}"
+
+    sel_html = data.get("selHtml", "").strip()
+    sel_text = data.get("selText", "").strip()
+    line_html = data.get("lineHtml", "").strip()
+    line_text = data.get("lineText", "").strip()
+    if not sel_html: tooltip("Select text first."); return
+
+    # Build cloze: replace the HTML of the selection with {{c1::...}} in the line HTML
+    if sel_html in line_html:
+        cloze_text = line_html.replace(sel_html, "{{c1::" + sel_html + "}}", 1)
+    elif sel_text in line_text:
+        # Fallback: use plain text replacement on the line, but keep HTML selection
+        cloze_text = line_text.replace(sel_text, "{{c1::" + sel_html + "}}", 1)
+    else:
+        cloze_text = "{{c1::" + sel_html + "}}"
 
     card = mw.reviewer.card
     if not card: return
