@@ -319,6 +319,56 @@ def _prepare_topics():
             if is_topic(fresh):
                 init_count += 1
 
+    # Step 1b: Link orphan extracts to parent sources and deprioritize parents
+    # Handles Zotero-imported extracts (pnid=0). Match by Reference field.
+    ref_to_source_nid = {}
+    cids2 = mw.col.find_cards(f'"deck:{deck}"')
+    seen2 = set()
+    for cid in cids2:
+        card = mw.col.get_card(cid)
+        if card.nid in seen2: continue
+        seen2.add(card.nid)
+        note = card.note()
+        if not is_topic(note): continue
+        if source_tag in note.tags:
+            m = get(note)
+            if m["st"] == "active":
+                fnames = [f["name"] for f in note.note_type()["flds"]]
+                if "Reference" in fnames:
+                    ref = note["Reference"].strip()
+                    if ref: ref_to_source_nid[ref] = note.id
+
+    new_extract_counts = {}  # source_nid → count of newly linked extracts
+    seen2.clear()
+    for cid in cids2:
+        card = mw.col.get_card(cid)
+        if card.nid in seen2: continue
+        seen2.add(card.nid)
+        note = card.note()
+        if not is_topic(note): continue
+        m = get(note)
+        if extract_tag not in note.tags: continue
+        if m.get("pnid", 0) != 0: continue  # already linked
+        fnames = [f["name"] for f in note.note_type()["flds"]]
+        if "Reference" not in fnames: continue
+        ref = note["Reference"].strip()
+        if not ref or ref not in ref_to_source_nid: continue
+        parent_nid = ref_to_source_nid[ref]
+        m["pnid"] = parent_nid
+        put(note, m); mw.col.update_note(note)
+        new_extract_counts[parent_nid] = new_extract_counts.get(parent_nid, 0) + 1
+
+    # SM19: deprioritize parent sources for each new Zotero extract
+    for parent_nid, count in new_extract_counts.items():
+        try:
+            pn = mw.col.get_note(parent_nid)
+            pm = get(pn)
+            for _ in range(count):
+                pm["af"] = scheduler.parent_af_after_extract(pm["af"])
+                pm["p"] = scheduler.parent_priority_after_extract(pm["p"])
+            put(pn, pm); mw.col.update_note(pn)
+        except: pass
+
     # Step 2: Auto-postpone
     postpone_count = 0
     if cfg("auto_postpone"):
