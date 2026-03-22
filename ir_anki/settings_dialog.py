@@ -64,7 +64,7 @@ def show_settings():
         ("initial_interval", "Initial interval (days)", "int"),
         ("default_priority", "Default priority (0-100)", "int"),
         ("randomization_degree", "Randomization (0-100)", "int"),
-        ("topic_ratio", "Topic ratio in IR session (%)", "int"),
+        ("topic_ratio", "Topic proportion in queue (%)", "int"),
     ])
     add_group("Overload", [
         ("auto_postpone", "Auto-postpone on session start", "bool"),

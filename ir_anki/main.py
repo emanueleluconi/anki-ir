@@ -239,12 +239,15 @@ def _ask_new_source_priority(sources):
 
 def _prepare_topics():
     """
-    Comprehensive topic preparation before review:
+    Comprehensive topic preparation before review (SM19-faithful):
     1. Auto-init IR-Data on any topic notes that don't have it yet
-    2. Auto-postpone overdue low-priority topics
+    2. Auto-postpone overdue low-priority topics (previous days only, per SM19)
     3. Clean orphan parent references
     4. Sync every topic card's Anki due date with IR-Data scheduling
-    5. Respect topic_ratio to limit how many topics show per session
+    5. ALL due topics are scheduled for today (no cap) — SM19 never caps topics.
+       The sorting criteria (topic_proportion) controls interleaving order,
+       not how many topics appear. If you don't finish, low-priority topics
+       stay for tomorrow — exactly like SM19.
     """
     if not mw.col: return
 
@@ -378,23 +381,13 @@ def _prepare_topics():
     orphan_count = clean_orphans(deck)
 
     # Step 4: Build priority queue and sync card due dates
+    # SM19: ALL due topics are scheduled for today. No cap.
+    # The priority queue determines the ORDER, not a limit.
     queue = build_queue(deck, cfg("randomization_degree"))
     due_set = set(queue)
+    topics_due = len(queue)
 
-    # Compute topic limit from ratio
-    items_deck = cfg("items_deck")
-    try:
-        items_due = len(mw.col.find_cards(f'"deck:{items_deck}" is:due'))
-    except:
-        items_due = 50
-    ratio = cfg("topic_ratio") / 100.0
-    if ratio > 0:
-        max_topics = max(1, round(items_due * ratio / max(0.01, 1 - ratio)))
-    else:
-        max_topics = 0
-    topics_to_show = min(len(queue), max_topics) if max_topics > 0 else len(queue)
-
-    # Step 5: Sync all topic cards
+    # Step 5: Sync all topic cards — every due topic is due today
     cids = mw.col.find_cards(f'"deck:{deck}"')
     seen.clear()
     for cid in cids:
@@ -411,11 +404,8 @@ def _prepare_topics():
             continue
 
         if card.nid in due_set:
-            pos = queue.index(card.nid)
-            if pos < topics_to_show:
-                _set_review(card, max(1, m["iv"]), 0)  # due today
-            else:
-                _set_review(card, max(1, m["iv"]), 1)  # overflow → tomorrow
+            # SM19: all due topics are due today, sorted by priority
+            _set_review(card, max(1, m["iv"]), 0)
         else:
             # Not due: sync from IR-Data
             if m["due"] and m["st"] == "active":
@@ -427,12 +417,21 @@ def _prepare_topics():
             else:
                 _set_review(card, max(1, m["iv"]), 30)
 
+    # Compute items due for stats display
+    items_deck = cfg("items_deck")
+    try:
+        items_due = len(mw.col.find_cards(f'"deck:{items_deck}" is:due'))
+    except:
+        items_due = 0
+    proportion = cfg("topic_ratio")
+
     parts = []
     if init_count: parts.append(f"{init_count} new topics initialized")
     if len(new_sources) and not init_count: parts.append(f"{len(new_sources)} sources skipped (cancelled)")
     if postpone_count: parts.append(f"{postpone_count} postponed")
     if orphan_count: parts.append(f"{orphan_count} orphans cleaned")
-    parts.append(f"{topics_to_show}/{len(queue)} topics due today")
+    parts.append(f"{topics_due} topics + {items_due} items due")
+    parts.append(f"target: {proportion}% topics")
     tooltip(f"IR: {', '.join(parts)}")
 
 
@@ -914,16 +913,28 @@ def _show_stats():
 
     queue = build_queue(cfg("topics_deck"), cfg("randomization_degree"))
 
+    # Also count items due
+    items_deck = cfg("items_deck")
+    try:
+        items_due_count = len(mw.col.find_cards(f'"deck:{items_deck}" is:due'))
+    except:
+        items_due_count = 0
+    proportion = cfg("topic_ratio")
+
     dlg = QDialog(mw)
     dlg.setWindowTitle("IR Queue Stats")
     dlg.setMinimumWidth(550); dlg.setMinimumHeight(400)
     layout = QVBoxLayout()
 
     # Stats summary
+    total_due = len(queue) + items_due_count
+    actual_pct = (len(queue) / total_due * 100) if total_due > 0 else 0
     stats = (
         f"Total: {total}  |  Active: {active}  |  Due today: {due}  |  "
         f"Done: {done}  |  Forgotten: {forgotten}\n"
-        f"Avg priority: {avg_p:.1f}%  |  Avg AF: {avg_af:.2f}  |  Avg interval: {avg_iv:.0f}d"
+        f"Avg priority: {avg_p:.1f}%  |  Avg AF: {avg_af:.2f}  |  Avg interval: {avg_iv:.0f}d\n"
+        f"Queue: {len(queue)} topics + {items_due_count} items = {total_due} total  |  "
+        f"Topic proportion: {actual_pct:.0f}% (target: {proportion}%)"
     )
     lbl = QLabel(stats); lbl.setWordWrap(True)
     layout.addWidget(lbl)
