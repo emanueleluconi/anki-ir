@@ -832,6 +832,10 @@ def _do_cloze(result):
             try: nn[f] = parent[f]
             except KeyError: pass
     nn.tags = list(parent.tags)
+    # Clozes are items, not topics — strip IR topic tags
+    st, et = cfg("source_tag"), cfg("extract_tag")
+    if st in nn.tags: nn.tags.remove(st)
+    if et in nn.tags: nn.tags.remove(et)
     did = mw.col.decks.id_for_name(cfg("items_deck")) or card.did
     nn.note_type()["did"] = did
     mw.col.addNote(nn)
