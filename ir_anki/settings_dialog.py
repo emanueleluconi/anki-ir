@@ -12,7 +12,7 @@ def show_settings():
         "topic_note_type": "Extracts", "cloze_note_type": "Cloze",
         "initial_interval": 1, "default_priority": 50, "randomization_degree": 5,
         "auto_postpone": True, "postpone_protection": 10, "mercy_days": 14,
-        "topic_ratio": 20, "source_tag": "ir::source", "extract_tag": "ir::extract",
+        "source_tag": "ir::source", "extract_tag": "ir::extract",
         "highlight_extract": "#5b9bd5", "highlight_cloze": "#c9a227",
         "key_extract": "x", "key_cloze": "z", "key_priority": "Shift+p",
         "key_priority_up": "Alt+Up", "key_priority_down": "Alt+Down",
@@ -64,7 +64,6 @@ def show_settings():
         ("initial_interval", "Initial interval (days)", "int"),
         ("default_priority", "Default priority (0-100)", "int"),
         ("randomization_degree", "Randomization (0-100)", "int"),
-        ("topic_ratio", "Topic proportion in queue (%)", "int"),
     ])
     add_group("Overload", [
         ("auto_postpone", "Auto-postpone on session start", "bool"),

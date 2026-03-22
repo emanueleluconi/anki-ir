@@ -36,7 +36,7 @@ def cfg(key):
         "topic_note_type": "Extracts", "cloze_note_type": "Cloze",
         "initial_interval": 1, "default_priority": 50, "randomization_degree": 5,
         "auto_postpone": True, "postpone_protection": 10, "mercy_days": 14,
-        "topic_ratio": 20, "source_tag": "ir::source", "extract_tag": "ir::extract",
+        "source_tag": "ir::source", "extract_tag": "ir::extract",
         "highlight_extract": "#5b9bd5", "highlight_cloze": "#c9a227",
         "key_extract": "x", "key_cloze": "z", "key_priority": "Shift+p",
         "key_priority_up": "Alt+Up", "key_priority_down": "Alt+Down",
@@ -387,7 +387,13 @@ def _prepare_topics():
     due_set = set(queue)
     topics_due = len(queue)
 
+    # Build position lookup for O(1) access
+    queue_pos = {nid: pos for pos, nid in enumerate(queue)}
+
     # Step 5: Sync all topic cards — every due topic is due today
+    # Priority encoding: we set card.due so that Anki's "Due date, then random"
+    # sort shows high-priority topics first. Position 0 (highest priority) gets
+    # the lowest due value (most "overdue" → shown first by Anki).
     cids = mw.col.find_cards(f'"deck:{deck}"')
     seen.clear()
     for cid in cids:
@@ -404,8 +410,14 @@ def _prepare_topics():
             continue
 
         if card.nid in due_set:
-            # SM19: all due topics are due today, sorted by priority
-            _set_review(card, max(1, m["iv"]), 0)
+            pos = queue_pos[card.nid]
+            # Offset: highest priority (pos=0) → most negative due → shown first
+            # We use a large base offset so topics reliably appear before
+            # same-day FSRS items (which have due = today or slightly before)
+            offset = topics_due - pos  # pos 0 → offset = N, pos N-1 → offset = 1
+            card.type = 2; card.queue = 2; card.ivl = max(1, m["iv"])
+            card.due = _col_day() - offset; card.left = 0
+            mw.col.update_card(card)
         else:
             # Not due: sync from IR-Data
             if m["due"] and m["st"] == "active":
@@ -417,21 +429,12 @@ def _prepare_topics():
             else:
                 _set_review(card, max(1, m["iv"]), 30)
 
-    # Compute items due for stats display
-    items_deck = cfg("items_deck")
-    try:
-        items_due = len(mw.col.find_cards(f'"deck:{items_deck}" is:due'))
-    except:
-        items_due = 0
-    proportion = cfg("topic_ratio")
-
     parts = []
     if init_count: parts.append(f"{init_count} new topics initialized")
     if len(new_sources) and not init_count: parts.append(f"{len(new_sources)} sources skipped (cancelled)")
     if postpone_count: parts.append(f"{postpone_count} postponed")
     if orphan_count: parts.append(f"{orphan_count} orphans cleaned")
-    parts.append(f"{topics_due} topics + {items_due} items due")
-    parts.append(f"target: {proportion}% topics")
+    parts.append(f"{topics_due} topics due")
     tooltip(f"IR: {', '.join(parts)}")
 
 
@@ -919,7 +922,6 @@ def _show_stats():
         items_due_count = len(mw.col.find_cards(f'"deck:{items_deck}" is:due'))
     except:
         items_due_count = 0
-    proportion = cfg("topic_ratio")
 
     dlg = QDialog(mw)
     dlg.setWindowTitle("IR Queue Stats")
@@ -927,14 +929,11 @@ def _show_stats():
     layout = QVBoxLayout()
 
     # Stats summary
-    total_due = len(queue) + items_due_count
-    actual_pct = (len(queue) / total_due * 100) if total_due > 0 else 0
     stats = (
         f"Total: {total}  |  Active: {active}  |  Due today: {due}  |  "
         f"Done: {done}  |  Forgotten: {forgotten}\n"
         f"Avg priority: {avg_p:.1f}%  |  Avg AF: {avg_af:.2f}  |  Avg interval: {avg_iv:.0f}d\n"
-        f"Queue: {len(queue)} topics + {items_due_count} items = {total_due} total  |  "
-        f"Topic proportion: {actual_pct:.0f}% (target: {proportion}%)"
+        f"Queue: {len(queue)} topics + {items_due_count} items due"
     )
     lbl = QLabel(stats); lbl.setWordWrap(True)
     layout.addWidget(lbl)
