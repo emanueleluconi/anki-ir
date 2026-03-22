@@ -387,9 +387,6 @@ def _prepare_topics():
     due_set = set(queue)
     topics_due = len(queue)
 
-    # Build position lookup for O(1) access
-    queue_pos = {nid: pos for pos, nid in enumerate(queue)}
-
     # Step 5: Sync all topic cards — every due topic is due today
     # Priority encoding: we set card.due so that Anki's "Due date, then random"
     # sort shows high-priority topics first. Position 0 (highest priority) gets
@@ -410,13 +407,15 @@ def _prepare_topics():
             continue
 
         if card.nid in due_set:
-            pos = queue_pos[card.nid]
-            # Offset: highest priority (pos=0) → most negative due → shown first
-            # We use a large base offset so topics reliably appear before
-            # same-day FSRS items (which have due = today or slightly before)
-            offset = topics_due - pos  # pos 0 → offset = N, pos N-1 → offset = 1
+            # SM19-faithful interleaving: all due topics get due=today so they
+            # mix naturally with FSRS items via Anki's "Due date, then random".
+            # SM19 uses a single queue with topics+items sorted by priority with
+            # some randomization. We can't control Anki's queue order from Python,
+            # but "Due date, then random" randomizes all same-day cards together,
+            # which provides natural interleaving. Our build_queue already applies
+            # the randomization_degree setting for SM19-style priority+randomness.
             card.type = 2; card.queue = 2; card.ivl = max(1, m["iv"])
-            card.due = _col_day() - offset; card.left = 0
+            card.due = _col_day(); card.left = 0
             mw.col.update_card(card)
         else:
             # Not due: sync from IR-Data
