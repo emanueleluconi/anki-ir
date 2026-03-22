@@ -9,6 +9,7 @@
     "auto_postpone": true,
     "postpone_protection": 10,
     "mercy_days": 14,
+    "topic_item_ratio": 5,
     "source_tag": "ir::source",
     "extract_tag": "ir::extract",
     "highlight_extract": "#5b9bd5",

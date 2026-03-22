@@ -36,6 +36,7 @@ def cfg(key):
         "topic_note_type": "Extracts", "cloze_note_type": "Cloze",
         "initial_interval": 1, "default_priority": 50, "randomization_degree": 5,
         "auto_postpone": True, "postpone_protection": 10, "mercy_days": 14,
+        "topic_item_ratio": 5,
         "source_tag": "ir::source", "extract_tag": "ir::extract",
         "highlight_extract": "#5b9bd5", "highlight_cloze": "#c9a227",
         "key_extract": "x", "key_cloze": "z", "key_priority": "Shift+p",
@@ -52,6 +53,14 @@ def cfg(key):
 _last_created_nid: Optional[int] = None
 _ir_toolbar: Optional[QToolBar] = None
 _text_history: dict = {}  # nid → list of previous Text field values (for undo)
+
+# SM19 interleaving state
+_interleave_topic_queue: list = []   # priority-sorted topic card IDs for this session
+_interleave_items_since: int = 0     # items shown since last topic
+_interleave_active: bool = False     # whether interleaving is active this session
+_interleave_swapping: bool = False   # guard against recursive _showQuestion calls
+_interleave_spacing: int = 5         # computed spacing: items per topic for this session
+_postponed_today: bool = False       # track if auto-postpone already ran today
 
 
 def _is_topic_card(card: Card) -> bool:
@@ -372,10 +381,12 @@ def _prepare_topics():
             put(pn, pm); mw.col.update_note(pn)
         except: pass
 
-    # Step 2: Auto-postpone
+    # Step 2: Auto-postpone (only once per day to avoid re-postponing on resume)
     postpone_count = 0
-    if cfg("auto_postpone"):
+    global _postponed_today
+    if cfg("auto_postpone") and not _postponed_today:
         postpone_count = auto_postpone(deck, cfg("postpone_protection"))
+        _postponed_today = True
 
     # Step 3: Clean orphans
     orphan_count = clean_orphans(deck)
@@ -387,12 +398,10 @@ def _prepare_topics():
     due_set = set(queue)
     topics_due = len(queue)
 
-    # Step 5: Sync all topic cards — every due topic is due today
-    # Priority encoding: we set card.due so that Anki's "Due date, then random"
-    # sort shows high-priority topics first. Position 0 (highest priority) gets
-    # the lowest due value (most "overdue" → shown first by Anki).
+    # Step 5: Sync all topic cards — all due topics get due=today
     cids = mw.col.find_cards(f'"deck:{deck}"')
     seen.clear()
+    topic_cid_map = {}  # nid → cid for due topics
     for cid in cids:
         card = mw.col.get_card(cid)
         if card.nid in seen: continue
@@ -407,16 +416,16 @@ def _prepare_topics():
             continue
 
         if card.nid in due_set:
-            # SM19-faithful interleaving: all due topics get due=today so they
-            # mix naturally with FSRS items via Anki's "Due date, then random".
-            # SM19 uses a single queue with topics+items sorted by priority with
-            # some randomization. We can't control Anki's queue order from Python,
-            # but "Due date, then random" randomizes all same-day cards together,
-            # which provides natural interleaving. Our build_queue already applies
-            # the randomization_degree setting for SM19-style priority+randomness.
+            # When interleaving is active (studying Main), set topics to due=tomorrow
+            # so Anki's queue won't serve them directly. Our swap mechanism in
+            # _on_show_question is the only way topics appear — this guarantees
+            # the ratio is respected and topics come in priority order.
+            # When studying Topics deck alone, interleaving is off and topics
+            # need due=today to appear normally.
             card.type = 2; card.queue = 2; card.ivl = max(1, m["iv"])
-            card.due = _col_day(); card.left = 0
+            card.due = _col_day(); card.left = 0  # default: due today
             mw.col.update_card(card)
+            topic_cid_map[card.nid] = card.id
         else:
             # Not due: sync from IR-Data
             if m["due"] and m["st"] == "active":
@@ -428,12 +437,78 @@ def _prepare_topics():
             else:
                 _set_review(card, max(1, m["iv"]), 30)
 
+    # Build SM19 interleave queue: topic CIDs in priority order
+    # Only activate interleaving when studying the parent deck (Main),
+    # not when studying Topics or Items sub-decks alone.
+    global _interleave_topic_queue, _interleave_items_since, _interleave_active, _interleave_swapping
+    _interleave_topic_queue = [topic_cid_map[nid] for nid in queue if nid in topic_cid_map]
+    _interleave_swapping = False
+
+    # Count items that will actually be studied today (needed before interleave decision)
+    items_deck = cfg("items_deck")
+    try:
+        items_did_val = mw.col.decks.id_for_name(items_deck)
+        tree = mw.col.sched.deck_due_tree()
+        def _find_deck_count(nodes, target_did):
+            for n in nodes:
+                if n.deck_id == target_did:
+                    return n.new_count + n.learn_count + n.review_count
+                r = _find_deck_count(n.children, target_did)
+                if r is not None: return r
+            return None
+        items_due_count = _find_deck_count(tree.children, items_did_val) or 0
+    except:
+        items_due_count = 0
+
+    # Detect if we're studying the parent deck (Main) vs a sub-deck
+    current_did = mw.col.decks.selected()
+    topics_did = mw.col.decks.id_for_name(cfg("topics_deck"))
+    items_did = mw.col.decks.id_for_name(cfg("items_deck"))
+    studying_parent = current_did != topics_did and current_did != items_did
+    _interleave_active = studying_parent and len(_interleave_topic_queue) > 0
+
+    # If there are no items to interleave with, disable interleaving so topics
+    # stay at due=today and appear normally (otherwise they'd be hidden forever)
+    if _interleave_active and items_due_count == 0:
+        _interleave_active = False
+
+    # If interleaving is active, hide topics from Anki's queue by setting due=tomorrow.
+    # Our swap mechanism is the only way they'll appear, guaranteeing ratio + priority order.
+    if _interleave_active:
+        for tcid in _interleave_topic_queue:
+            try:
+                tc = mw.col.get_card(tcid)
+                tc.due = _col_day() + 1  # tomorrow — hidden from today's queue
+                mw.col.update_card(tc)
+            except: pass
+
+    # Start with items_since = spacing so the first card triggers a topic
+    # if Anki gives us an item. This ensures SM19 behavior: high-priority
+    # topic first, then items, then next topic, etc.
+    configured_ratio = cfg("topic_item_ratio") or 5
+    _interleave_items_since = configured_ratio
+
+    # Compute spacing for the session: items per topic
+    global _interleave_spacing
+    n_topics = len(_interleave_topic_queue)
+    if n_topics > 0 and items_due_count > 0:
+        # Use configured ratio, but reduce if not enough items
+        if items_due_count < n_topics * configured_ratio:
+            _interleave_spacing = max(1, items_due_count // n_topics)
+        else:
+            _interleave_spacing = configured_ratio
+    else:
+        _interleave_spacing = configured_ratio
+
     parts = []
     if init_count: parts.append(f"{init_count} new topics initialized")
     if len(new_sources) and not init_count: parts.append(f"{len(new_sources)} sources skipped (cancelled)")
     if postpone_count: parts.append(f"{postpone_count} postponed")
     if orphan_count: parts.append(f"{orphan_count} orphans cleaned")
-    parts.append(f"{topics_due} topics due")
+    if items_due_count > 0 and topics_due > 0:
+        parts.append(f"{topics_due} topics + {items_due_count} items ({_interleave_spacing} items/topic)")
+    else:
+        parts.append(f"{topics_due} topics due")
     tooltip(f"IR: {', '.join(parts)}")
 
 
@@ -468,7 +543,7 @@ def _custom_answer_card(self, ease, _old):
 
 
 def _custom_answer_buttons(self, _old):
-    if _is_topic_card(self.card):
+    if self.card and _is_topic_card(self.card):
         m = get(self.card.note())
         next_iv = scheduler.compute_next_interval(max(1, m["iv"]), m["af"])
         return ((1, f"Next ({next_iv}d)"),)
@@ -514,14 +589,85 @@ def _setup_toolbar():
 
 
 def _on_show_question(card: Card):
+    """SM19 interleaving: enforce topic/item alternation pattern.
+    
+    After every N items (where N = items_due / topics_due), inject the next
+    priority-sorted topic. If Anki shows an item when it's topic turn,
+    we swap the displayed card with our next topic.
+    """
+    global _interleave_items_since, _interleave_active, _interleave_swapping
+
     if _ir_toolbar: _ir_toolbar.setVisible(_is_topic_card(card))
+
+    # Guard against recursive calls from our own _showQuestion swap
+    if _interleave_swapping:
+        if _is_topic_card(card):
+            m = get(card.note())
+            tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+        return
+
+    if not _interleave_active:
+        # No interleaving (no topics due or studying sub-deck alone)
+        if _is_topic_card(card):
+            m = get(card.note())
+            tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+        return
+
     if _is_topic_card(card):
+        # Anki gave us a topic naturally (shouldn't happen if interleaving is
+        # working correctly, since topics should have due=tomorrow).
+        # Accept it anyway, reset counter.
+        _interleave_items_since = 0
+        try: _interleave_topic_queue.remove(card.id)
+        except ValueError: pass
         m = get(card.note())
         tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+        return
+
+    # Anki gave us an item
+    _interleave_items_since += 1
+
+    # Check if it's time for a topic
+    if not _interleave_topic_queue:
+        return  # no more topics to interleave
+
+    if _interleave_items_since >= _interleave_spacing:
+        # Time for a topic! Swap the current card with our next priority topic.
+        next_topic_cid = _interleave_topic_queue.pop(0)
+        _interleave_items_since = 0
+        try:
+            topic_card = mw.col.get_card(next_topic_cid)
+            mw.reviewer.card = topic_card
+            mw.reviewer.card.start_timer()
+            if _ir_toolbar: _ir_toolbar.setVisible(True)
+            m = get(topic_card.note())
+            tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+            # Use _redraw_current_card which reloads and re-renders without
+            # going through the full nextCard/v3 pipeline
+            _interleave_swapping = True
+            mw.reviewer._showQuestion()
+            _interleave_swapping = False
+        except Exception:
+            _interleave_swapping = False
 
 
 def _on_review_end():
+    global _interleave_active, _interleave_topic_queue, _interleave_swapping, _interleave_spacing
     if _ir_toolbar: _ir_toolbar.setVisible(False)
+    # Restore any remaining topics to due=today so they're available
+    # if user studies Topics alone or comes back later
+    if _interleave_topic_queue and mw.col:
+        today = _col_day()
+        for tcid in _interleave_topic_queue:
+            try:
+                tc = mw.col.get_card(tcid)
+                tc.due = today
+                mw.col.update_card(tc)
+            except: pass
+    _interleave_active = False
+    _interleave_topic_queue = []
+    _interleave_swapping = False
+    _interleave_spacing = 5
 
 
 # ============================================================
@@ -621,33 +767,16 @@ def _do_extract(html):
 
 def _cmd_cloze():
     if mw.state != "review": return
-    # Get both HTML and plain text of selection + containing line
+    # Get ONLY the HTML of the selection
     js = """(function(){
         var sel=window.getSelection();
         if(!sel||sel.isCollapsed)return JSON.stringify({err:1});
         var range=sel.getRangeAt(0);
-        // Get HTML of selection
         var div=document.createElement('div');
         div.appendChild(range.cloneContents());
         var selHtml=div.innerHTML;
         var selText=sel.toString().trim();
-        // Find the containing block element for the full line
-        var node=range.startContainer;
-        var block=node.nodeType===3?node.parentElement:node;
-        while(block&&block!==document.body){
-            var tag=block.tagName?block.tagName.toLowerCase():"";
-            if(["p","div","li","td","th","blockquote","h1","h2","h3","h4","h5","h6"].indexOf(tag)>=0)break;
-            block=block.parentElement;
-        }
-        // Get HTML of the full line/block
-        var lineHtml=block?block.innerHTML:selHtml;
-        var lineText=block?block.innerText:selText;
-        // Find the best matching line in plain text (for multi-line blocks)
-        var lines=lineText.split("\\n");
-        var bestLine=lines[0]||lineText;
-        var sub=selText.substring(0,Math.min(20,selText.length));
-        for(var i=0;i<lines.length;i++){if(lines[i].indexOf(sub)>=0){bestLine=lines[i];break;}}
-        return JSON.stringify({selHtml:selHtml,selText:selText,lineHtml:lineHtml,lineText:bestLine.trim()});
+        return JSON.stringify({selHtml:selHtml,selText:selText});
     })();"""
     mw.web.evalWithCallback(js, _do_cloze)
 
@@ -659,17 +788,34 @@ def _do_cloze(result):
 
     sel_html = data.get("selHtml", "").strip()
     sel_text = data.get("selText", "").strip()
-    line_html = data.get("lineHtml", "").strip()
-    line_text = data.get("lineText", "").strip()
     if not sel_html: tooltip("Select text first."); return
 
-    # Build cloze: replace the HTML of the selection with {{c1::...}} in the line HTML
-    if sel_html in line_html:
-        cloze_text = line_html.replace(sel_html, "{{c1::" + sel_html + "}}", 1)
-    elif sel_text in line_text:
-        # Fallback: use plain text replacement on the line, but keep HTML selection
-        cloze_text = line_text.replace(sel_text, "{{c1::" + sel_html + "}}", 1)
+    card = mw.reviewer.card
+    if not card: return
+    parent = card.note()
+
+    # Get the Text field content directly from the note (not rendered card)
+    parent_fnames = [f["name"] for f in parent.note_type()["flds"]]
+    parent_text = ""
+    if "Text" in parent_fnames:
+        parent_text = parent["Text"]
+    elif parent.fields:
+        parent_text = parent.fields[0]
+
+    # SM19 approach: use the FULL text of the parent with the selection clozed.
+    # This avoids sentence-truncation errors and matches SM19 behavior where
+    # the cloze card contains the full extract context.
+    import re as _re
+    if sel_html in parent_text:
+        cloze_text = parent_text.replace(sel_html, "{{c1::" + sel_html + "}}", 1)
+    elif sel_text and sel_text in _re.sub(r'<[^>]+>', '', parent_text):
+        # Plain text match — do replacement on the raw HTML by finding the text
+        # within tags. Use a simple approach: replace in stripped text, then
+        # reconstruct. Safer: just use the full parent text with plain cloze.
+        plain = _re.sub(r'<[^>]+>', '', parent_text)
+        cloze_text = plain.replace(sel_text, "{{c1::" + sel_text + "}}", 1)
     else:
+        # Fallback: just the selection as cloze
         cloze_text = "{{c1::" + sel_html + "}}"
 
     card = mw.reviewer.card
@@ -692,7 +838,9 @@ def _do_cloze(result):
     _last_created_nid = nn.id
 
     # Bury new cloze so it appears tomorrow via FSRS, not today
-    for nc in nn.cards(): _shelve(nc)
+    new_cids = [nc.id for nc in nn.cards()]
+    if new_cids:
+        mw.col.sched.bury_cards(new_cids)
 
     color = cfg("highlight_cloze")
     mw.web.eval(f"""(function(){{
@@ -745,6 +893,8 @@ def _cmd_reschedule():
     # Note: lr (last review) NOT updated — this is the key SM Ctrl+J behavior
     put(note, m); mw.col.update_note(note)
     _set_review(card, m["iv"], days)
+    try: _interleave_topic_queue.remove(card.id)
+    except ValueError: pass
     tooltip(f"Reschedule: +{days}d → interval {r['iv']}d"); mw.reviewer.nextCard()
 
 def _cmd_execute_rep():
@@ -763,6 +913,8 @@ def _cmd_execute_rep():
     m["lr"] = scheduler.today_str(); m["rc"] += 1
     put(note, m); mw.col.update_note(note)
     _set_review(card, days, days)
+    try: _interleave_topic_queue.remove(card.id)
+    except ValueError: pass
     tooltip(f"Execute rep: interval={days}d, AF={m['af']:.2f}"); mw.reviewer.nextCard()
 
 def _cmd_postpone():
@@ -774,10 +926,13 @@ def _cmd_postpone():
     m["due"], m["iv"], m["af"] = r["due"], r["iv"], r["af"]
     put(note, m); mw.col.update_note(note)
     _set_review(card, r["iv"], r["iv"])
+    try: _interleave_topic_queue.remove(card.id)
+    except ValueError: pass
     tooltip(f"Postponed: {r['iv']}d"); mw.reviewer.nextCard()
 
 def _cmd_later_today():
-    """SM Ctrl+Shift+J: due=today, interval unchanged."""
+    """SM Ctrl+Shift+J: put back in today's queue without changing interval.
+    The card will reappear later in today's session."""
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
     note = card.note(); m = get(note)
@@ -785,13 +940,17 @@ def _cmd_later_today():
     # Interval, AF, priority all stay unchanged
     put(note, m); mw.col.update_note(note)
     _set_review(card, m["iv"], 0)
+    # If interleaving is active, re-hide the topic so it comes back via swap mechanism
+    if _interleave_active:
+        card.due = _col_day() + 1
+        mw.col.update_card(card)
     tooltip("Later today (interval unchanged)")
+    mw.reviewer.nextCard()
 
 def _cmd_advance_today():
     """SM Advance: move to today + boost priority by 10%."""
     card = mw.reviewer.card
     if not card or not _is_topic_card(card):
-        # Also works outside review: advance by note ID from browser
         return
     note = card.note(); m = get(note)
     m["due"] = scheduler.today_str()
@@ -800,7 +959,13 @@ def _cmd_advance_today():
     m["iv"] = 1
     put(note, m); mw.col.update_note(note)
     _set_review(card, 1, 0)
+    # If interleaving is active, re-hide the topic so it comes back via swap mechanism
+    if _interleave_active:
+        card.due = _col_day() + 1
+        mw.col.update_card(card)
+    # Don't remove from queue — card is due today and should reappear
     tooltip(f"Advanced to today. Priority: {m['p']:.1f}%")
+    mw.reviewer.nextCard()
 
 def _cmd_done():
     card = mw.reviewer.card
@@ -810,6 +975,9 @@ def _cmd_done():
     # Suspend all cards of this note (Anki suspend = permanently out of review)
     cids = [c.id for c in note.cards()]
     mw.col.sched.suspend_cards(cids)
+    # Remove from interleave queue
+    try: _interleave_topic_queue.remove(card.id)
+    except ValueError: pass
     tooltip("Done (suspended)"); mw.reviewer.nextCard()
 
 def _cmd_forget():
@@ -819,16 +987,65 @@ def _cmd_forget():
     put(note, m); mw.col.update_note(note)
     card.type = 2; card.queue = -2; card.due = _col_day() + 9999
     mw.col.update_card(card)
+    # Remove from interleave queue
+    try: _interleave_topic_queue.remove(card.id)
+    except ValueError: pass
     tooltip("Forgotten"); mw.reviewer.nextCard()
 
 def _cmd_edit_last():
+    """Open the last created note in the editor for quick editing."""
     global _last_created_nid
     if not _last_created_nid: tooltip("No recent card."); return
     try:
-        from aqt.browser.browser import Browser
-        b = Browser(mw)
-        b.form.searchEdit.lineEdit().setText(f"nid:{_last_created_nid}")
-        b.onSearchActivated(); b.show()
+        from aqt.editcurrent import EditCurrent
+        note = mw.col.get_note(_last_created_nid)
+        # Find a card for this note to use with the editor
+        cards = note.cards()
+        if not cards: tooltip("Card not found."); return
+        # Save and restore the current reviewer card after editing
+        saved_card = mw.reviewer.card
+        # Use Anki's built-in note editor dialog
+        from aqt.qt import QDialog, QVBoxLayout, QPushButton, QHBoxLayout
+        from aqt.editor import Editor
+
+        dlg = QDialog(mw)
+        dlg.setWindowTitle("Edit Card")
+        dlg.setMinimumWidth(600)
+        dlg.setMinimumHeight(400)
+        layout = QVBoxLayout()
+
+        editor = Editor(mw, dlg, dlg, addMode=False)
+        editor.set_note(note)
+        layout.addWidget(editor.widget)
+
+        btn_row = QHBoxLayout()
+        close_btn = QPushButton("Close")
+        close_btn.setAutoDefault(False)
+        def _save_and_close():
+            editor.saveNow(lambda: None)
+            dlg.accept()
+        close_btn.clicked.connect(_save_and_close)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        dlg.setLayout(layout)
+        dlg.exec()
+
+        # After dialog closes, restore the reviewer state
+        # Also re-bury all cards of the edited note (user may have added new clozes)
+        if _last_created_nid:
+            try:
+                edited_note = mw.col.get_note(_last_created_nid)
+                new_cids = [c.id for c in edited_note.cards()]
+                if new_cids:
+                    mw.col.sched.bury_cards(new_cids)
+            except: pass
+
+        if mw.state == "review" and saved_card:
+            mw.reviewer.card = saved_card
+            mw.reviewer.card.load()
+            mw.reviewer._redraw_current_card()
     except Exception as ex:
         tooltip(f"Error: {ex}")
 
@@ -918,7 +1135,16 @@ def _show_stats():
     # Also count items due
     items_deck = cfg("items_deck")
     try:
-        items_due_count = len(mw.col.find_cards(f'"deck:{items_deck}" is:due'))
+        items_did = mw.col.decks.id_for_name(items_deck)
+        tree = mw.col.sched.deck_due_tree()
+        def _find_items(nodes, target_did):
+            for n in nodes:
+                if n.deck_id == target_did:
+                    return n.new_count + n.learn_count + n.review_count
+                r = _find_items(n.children, target_did)
+                if r is not None: return r
+            return None
+        items_due_count = _find_items(tree.children, items_did) or 0
     except:
         items_due_count = 0
 
@@ -974,6 +1200,7 @@ def _show_stats():
 class IRManager:
     def __init__(self):
         gui_hooks.profile_did_open.append(self._on_profile)
+        gui_hooks.profile_will_close.append(self._on_profile_close)
         gui_hooks.reviewer_did_show_question.append(_on_show_question)
         gui_hooks.state_did_change.append(self._on_state_change)
         gui_hooks.browser_will_show_context_menu.append(_on_browser_context_menu)
@@ -1007,8 +1234,15 @@ class IRManager:
         _setup_toolbar()
         mw.addonManager.setConfigAction(_ADDON_NAME, show_settings)
 
+    def _on_profile_close(self):
+        """Restore topics to due=today on shutdown so they're not stuck at tomorrow."""
+        _on_review_end()
+
     def _on_state_change(self, new_state, old_state):
-        if new_state == "review": _prepare_topics()
+        if new_state == "review":
+            # Always prepare topics when entering review — this rebuilds the queue
+            # fresh with current state. Safe to call multiple times.
+            _prepare_topics()
         if old_state == "review": _on_review_end()
 
     def _ensure_field(self):
