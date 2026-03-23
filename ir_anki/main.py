@@ -1137,6 +1137,25 @@ def _cmd_undo_text():
 
 
 # ============================================================
+# Zotero sync
+# ============================================================
+
+def _zotero_sync():
+    try:
+        from .zotero_sync import sync
+        tooltip("Zotero: Syncing...")
+        s, e = sync()
+        tooltip(f"Zotero: {s} sources, {e} extracts created.")
+    except Exception as ex:
+        tooltip(f"Zotero error: {ex}")
+        import traceback; traceback.print_exc()
+
+def _zotero_reset():
+    from .zotero_sync import reset_state
+    reset_state()
+
+
+# ============================================================
 # Menu
 # ============================================================
 
@@ -1156,6 +1175,9 @@ def _add_menu():
     _a("Clean Orphans", lambda: showInfo(f"Cleaned {clean_orphans(cfg('topics_deck'))} orphans."))
     menu.addSeparator()
     _a("Queue Stats", _show_stats)
+    menu.addSeparator()
+    _a("Sync from Zotero", _zotero_sync)
+    _a("Reset Zotero Sync", _zotero_reset)
 
 
 def _init_topics():

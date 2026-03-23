@@ -28,5 +28,9 @@
     "key_advance_today": "Shift+a",
     "key_edit_last": "Shift+e",
     "key_undo_text": "Alt+z",
-    "key_prepare": "Ctrl+Shift+p"
+    "key_prepare": "Ctrl+Shift+p",
+    "zotero_library_id": "",
+    "zotero_api_key": "",
+    "zotero_import_tag": "imported",
+    "zotero_highlight_color": "#ffd400"
 }

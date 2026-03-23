@@ -22,6 +22,8 @@ def show_settings():
         "key_later_today": "Shift+l", "key_advance_today": "Shift+a",
         "key_edit_last": "Shift+e", "key_undo_text": "Ctrl+z",
         "key_prepare": "Ctrl+Shift+p",
+        "zotero_library_id": "", "zotero_api_key": "",
+        "zotero_import_tag": "imported", "zotero_highlight_color": "#ffd400",
     }
     for k, v in defaults.items():
         if k not in conf: conf[k] = v
@@ -97,6 +99,13 @@ def show_settings():
     add_group("Highlight Colors", [
         ("highlight_extract", "Extract highlight", "str"),
         ("highlight_cloze", "Cloze highlight", "str"),
+    ])
+
+    add_group("Zotero Integration", [
+        ("zotero_library_id", "Library ID", "str"),
+        ("zotero_api_key", "API Key", "str"),
+        ("zotero_import_tag", "Import tag (sources)", "str"),
+        ("zotero_highlight_color", "Highlight color (extracts)", "str"),
     ])
 
     # Buttons
