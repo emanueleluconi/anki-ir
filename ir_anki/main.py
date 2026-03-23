@@ -61,7 +61,9 @@ _interleave_items_since: int = 0     # items shown since last topic
 _interleave_active: bool = False     # whether interleaving is active this session
 _interleave_swapping: bool = False   # guard against recursive _showQuestion calls
 _interleave_spacing: int = 5         # computed spacing: items per topic for this session
+_interleave_shown_topics: set = set()  # topic card IDs already shown this session
 _postponed_today: bool = False       # track if auto-postpone already ran today
+_prepare_done_for_session: bool = False  # prevent re-running _prepare_topics in same session
 
 
 def _is_topic_card(card: Card) -> bool:
@@ -399,53 +401,12 @@ def _prepare_topics():
     due_set = set(queue)
     topics_due = len(queue)
 
-    # Step 5: Sync all topic cards — all due topics get due=today
-    cids = mw.col.find_cards(f'"deck:{deck}"')
-    seen.clear()
-    topic_cid_map = {}  # nid → cid for due topics
-    for cid in cids:
-        card = mw.col.get_card(cid)
-        if card.nid in seen: continue
-        seen.add(card.nid)
-        note = card.note()
-        if not is_topic(note): continue
-        m = get(note)
-
-        if m["st"] in ("done", "dismissed", "forgotten"):
-            card.type = 2; card.queue = -2; card.ivl = 9999
-            card.due = _col_day() + 9999; mw.col.update_card(card)
-            continue
-
-        if card.nid in due_set:
-            # When interleaving is active (studying Main), set topics to due=tomorrow
-            # so Anki's queue won't serve them directly. Our swap mechanism in
-            # _on_show_question is the only way topics appear — this guarantees
-            # the ratio is respected and topics come in priority order.
-            # When studying Topics deck alone, interleaving is off and topics
-            # need due=today to appear normally.
-            card.type = 2; card.queue = 2; card.ivl = max(1, m["iv"])
-            card.due = _col_day(); card.left = 0  # default: due today
-            mw.col.update_card(card)
-            topic_cid_map[card.nid] = card.id
-        else:
-            # Not due: sync from IR-Data
-            if m["due"] and m["st"] == "active":
-                try:
-                    delta = max(1, (date.fromisoformat(m["due"]) - date.today()).days)
-                except:
-                    delta = max(1, m["iv"])
-                _set_review(card, max(1, m["iv"]), delta)
-            else:
-                _set_review(card, max(1, m["iv"]), 30)
-
-    # Build SM19 interleave queue: topic CIDs in priority order
-    # Only activate interleaving when studying the parent deck (Main),
-    # not when studying Topics or Items sub-decks alone.
+    # Step 5: Determine interleaving BEFORE setting topic due dates
+    # We need to know if interleaving is active to decide due=today vs due=tomorrow
     global _interleave_topic_queue, _interleave_items_since, _interleave_active, _interleave_swapping
-    _interleave_topic_queue = [topic_cid_map[nid] for nid in queue if nid in topic_cid_map]
     _interleave_swapping = False
 
-    # Count items that will actually be studied today (needed before interleave decision)
+    # Count items
     items_deck = cfg("items_deck")
     try:
         items_did_val = mw.col.decks.id_for_name(items_deck)
@@ -461,45 +422,72 @@ def _prepare_topics():
     except:
         items_due_count = 0
 
-    # Detect if we're studying the parent deck (Main) vs a sub-deck
+    # Detect if studying parent deck
     current_did = mw.col.decks.selected()
     topics_did = mw.col.decks.id_for_name(cfg("topics_deck"))
     items_did = mw.col.decks.id_for_name(cfg("items_deck"))
     studying_parent = current_did != topics_did and current_did != items_did
-    _interleave_active = studying_parent and len(_interleave_topic_queue) > 0
+    will_interleave = studying_parent and topics_due > 0 and items_due_count > 0
 
-    # If there are no items to interleave with, disable interleaving so topics
-    # stay at due=today and appear normally (otherwise they'd be hidden forever)
-    if _interleave_active and items_due_count == 0:
-        _interleave_active = False
+    # Step 6: Sync all topic cards — set due based on interleaving decision
+    cids = mw.col.find_cards(f'"deck:{deck}"')
+    seen.clear()
+    topic_cid_map = {}
+    for cid in cids:
+        card = mw.col.get_card(cid)
+        if card.nid in seen: continue
+        seen.add(card.nid)
+        note = card.note()
+        if not is_topic(note): continue
+        m = get(note)
 
-    # If interleaving is active, hide topics from Anki's queue by setting due=tomorrow.
-    # Our swap mechanism is the only way they'll appear, guaranteeing ratio + priority order.
-    if _interleave_active:
-        for tcid in _interleave_topic_queue:
-            try:
-                tc = mw.col.get_card(tcid)
-                tc.due = _col_day() + 1  # tomorrow — hidden from today's queue
-                mw.col.update_card(tc)
-            except: pass
+        if m["st"] in ("done", "dismissed", "forgotten"):
+            card.type = 2; card.queue = -2; card.ivl = 9999
+            card.due = _col_day() + 9999; mw.col.update_card(card)
+            continue
+
+        if card.nid in due_set:
+            card.type = 2; card.queue = 2; card.ivl = max(1, m["iv"])
+            if will_interleave:
+                # Hide from Anki's queue — only our swap mechanism serves them
+                card.due = _col_day() + 1; card.left = 0
+            else:
+                # No interleaving — due today for normal review
+                card.due = _col_day(); card.left = 0
+            mw.col.update_card(card)
+            topic_cid_map[card.nid] = card.id
+        else:
+            if m["due"] and m["st"] == "active":
+                try:
+                    delta = max(1, (date.fromisoformat(m["due"]) - date.today()).days)
+                except:
+                    delta = max(1, m["iv"])
+                _set_review(card, max(1, m["iv"]), delta)
+            else:
+                _set_review(card, max(1, m["iv"]), 30)
+
+    # Build interleave queue
+    _interleave_topic_queue = [topic_cid_map[nid] for nid in queue if nid in topic_cid_map]
+    _interleave_active = will_interleave
 
     # Start with items_since = spacing so the first card triggers a topic
     # if Anki gives us an item. This ensures SM19 behavior: high-priority
     # topic first, then items, then next topic, etc.
     configured_ratio = cfg("topic_item_ratio") or 5
-    _interleave_items_since = configured_ratio
 
     # Compute spacing for the session: items per topic
     global _interleave_spacing
     n_topics = len(_interleave_topic_queue)
     if n_topics > 0 and items_due_count > 0:
-        # Use configured ratio, but reduce if not enough items
         if items_due_count < n_topics * configured_ratio:
             _interleave_spacing = max(1, items_due_count // n_topics)
         else:
             _interleave_spacing = configured_ratio
     else:
         _interleave_spacing = configured_ratio
+
+    # Start with items_since = spacing so the first card triggers a topic
+    _interleave_items_since = _interleave_spacing
 
     parts = []
     if init_count: parts.append(f"{init_count} new topics initialized")
@@ -511,6 +499,9 @@ def _prepare_topics():
     else:
         parts.append(f"{topics_due} topics due")
     tooltip(f"IR: {', '.join(parts)}")
+
+    global _prepare_done_for_session
+    _prepare_done_for_session = True
 
 
 # ============================================================
@@ -590,12 +581,7 @@ def _setup_toolbar():
 
 
 def _on_show_question(card: Card):
-    """SM19 interleaving: enforce topic/item alternation pattern.
-    
-    After every N items (where N = items_due / topics_due), inject the next
-    priority-sorted topic. If Anki shows an item when it's topic turn,
-    we swap the displayed card with our next topic.
-    """
+    """SM19 interleaving: enforce topic/item alternation pattern."""
     global _interleave_items_since, _interleave_active, _interleave_swapping
 
     if _ir_toolbar: _ir_toolbar.setVisible(_is_topic_card(card))
@@ -607,6 +593,11 @@ def _on_show_question(card: Card):
             tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
         return
 
+    # If interleaving hasn't been set up yet (first card shown before
+    # _prepare_topics finished), run it now — but only once per session
+    if not _prepare_done_for_session and mw.state == "review":
+        _prepare_topics()
+
     if not _interleave_active:
         # No interleaving (no topics due or studying sub-deck alone)
         if _is_topic_card(card):
@@ -615,10 +606,33 @@ def _on_show_question(card: Card):
         return
 
     if _is_topic_card(card):
-        # Anki gave us a topic naturally (shouldn't happen if interleaving is
-        # working correctly, since topics should have due=tomorrow).
-        # Accept it anyway, reset counter.
+        # Check if we already showed this topic (Anki serving a duplicate)
+        if card.id in _interleave_shown_topics:
+            # Already shown — skip to next card
+            mw.reviewer.nextCard()
+            return
+
+        # Anki gave us a topic naturally. Check if it's the correct one
+        if _interleave_topic_queue and card.id != _interleave_topic_queue[0]:
+            next_topic_cid = _interleave_topic_queue.pop(0)
+            _interleave_items_since = 0
+            _interleave_shown_topics.add(next_topic_cid)
+            try:
+                topic_card = mw.col.get_card(next_topic_cid)
+                mw.reviewer.card = topic_card
+                mw.reviewer.card.start_timer()
+                if _ir_toolbar: _ir_toolbar.setVisible(True)
+                m = get(topic_card.note())
+                tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+                _interleave_swapping = True
+                mw.reviewer._showQuestion()
+                _interleave_swapping = False
+            except Exception:
+                _interleave_swapping = False
+            return
+        # Correct topic or queue empty — accept it
         _interleave_items_since = 0
+        _interleave_shown_topics.add(card.id)
         try: _interleave_topic_queue.remove(card.id)
         except ValueError: pass
         m = get(card.note())
@@ -636,6 +650,7 @@ def _on_show_question(card: Card):
         # Time for a topic! Swap the current card with our next priority topic.
         next_topic_cid = _interleave_topic_queue.pop(0)
         _interleave_items_since = 0
+        _interleave_shown_topics.add(next_topic_cid)
         try:
             topic_card = mw.col.get_card(next_topic_cid)
             mw.reviewer.card = topic_card
@@ -653,7 +668,7 @@ def _on_show_question(card: Card):
 
 
 def _on_review_end():
-    global _interleave_active, _interleave_topic_queue, _interleave_swapping, _interleave_spacing
+    global _interleave_active, _interleave_topic_queue, _interleave_swapping, _interleave_spacing, _prepare_done_for_session
     if _ir_toolbar: _ir_toolbar.setVisible(False)
     # Restore any remaining topics to due=today so they're available
     # if user studies Topics alone or comes back later
@@ -669,8 +684,10 @@ def _on_review_end():
     _interleave_topic_queue = []
     _interleave_swapping = False
     _interleave_spacing = 5
+    _interleave_shown_topics = set()
+    _prepare_done_for_session = False
     # Tell Anki to recalculate deck counts (lighter than mw.reset())
-    if mw.col:
+    if mw.col and _prepare_done_for_session:
         try: mw.col.reset()
         except: pass
 
@@ -1274,11 +1291,11 @@ class IRManager:
         _on_review_end()
 
     def _on_state_change(self, new_state, old_state):
-        if new_state == "review":
-            # Always prepare topics when entering review — this rebuilds the queue
-            # fresh with current state. Safe to call multiple times.
-            _prepare_topics()
         if old_state == "review": _on_review_end()
+        # Note: _prepare_topics is NOT called here. It's called from
+        # _on_show_question on the first card, which ensures topics are
+        # hidden BEFORE Anki shows any card. This avoids the race condition
+        # where Anki grabs cards before we hide topics.
 
     def _ensure_field(self):
         if not mw.col: return

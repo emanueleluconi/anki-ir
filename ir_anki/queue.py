@@ -30,7 +30,7 @@ def build_queue(deck_name, randomization=0):
         due = m.get("due")
         if not due or due > today: continue
         cands.append((m["p"], nid))
-    cands.sort(key=lambda x: x[0])
+    cands.sort(key=lambda x: (x[0], x[1]))  # sort by priority, then nid for stability
     if randomization > 0 and len(cands) > 1:
         deg = randomization / 100
         mx = max(1, int(deg * len(cands)))
