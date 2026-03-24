@@ -185,12 +185,13 @@ def _strip_html(h):
 
 def _exists(zotero_key):
     """Check if a note with this Zotero key exists anywhere in the collection.
-    Searches Back Extra for SourceID or NoteID containing the key."""
+    Searches all note fields for the Zotero item key string."""
     if not mw.col:
         return False
     try:
-        # Search across all decks for this specific Zotero key
-        nids = mw.col.find_notes(f'"SourceID: {zotero_key}" OR "NoteID: {zotero_key}"')
+        # Search for the raw Zotero key in any field — it's unique enough
+        # and appears in Back Extra as part of SourceID/NoteID links
+        nids = mw.col.find_notes(f'"{zotero_key}"')
         return len(nids) > 0
     except Exception:
         return False
@@ -323,17 +324,26 @@ def sync():
         if _create_note(text, ref, back, tags):
             sources += 1
 
-    # Pass 2: Annotations (yellow highlights → extracts)
+    # Pass 2: Annotations → extracts
+    # Handles: (a) colored highlights, (b) sticky note annotations
     for it in items:
         d = it["data"]
         key = it["key"]
         itype = d.get("itemType", "")
 
         if itype == "annotation":
-            if (d.get("annotationColor") or "").lower() != hl_color:
-                continue
-            hl = (d.get("annotationText") or "").strip()
-            if not hl:
+            ann_type = d.get("annotationType", "")
+            ann_color = (d.get("annotationColor") or "").lower()
+            hl_text = (d.get("annotationText") or "").strip()
+            comment = (d.get("annotationComment") or "").strip()
+
+            # Determine if this annotation should be imported:
+            # (a) Highlight with matching color and text
+            # (b) Sticky note annotation (annotationType="note") with comment
+            is_highlight = hl_text and ann_color == hl_color
+            is_sticky_note = ann_type == "note" and comment
+
+            if not is_highlight and not is_sticky_note:
                 continue
             if _exists(key):
                 continue
@@ -344,10 +354,14 @@ def sync():
             title, year, authors = _item_data(parent["data"])
             ref, tag, _ = _fmt_authors(authors, year, title)
 
-            comment = (d.get("annotationComment") or "").strip()
-            combined = hl
-            if comment:
-                combined += f"<br><br>{comment}"
+            # Build the text content
+            if is_highlight:
+                combined = hl_text
+                if comment:
+                    combined += f"<br><br>{comment}"
+            else:
+                # Sticky note: comment is the main content
+                combined = comment
             combined = combined.replace("\n", "<br>")
 
             pk = parent["key"]

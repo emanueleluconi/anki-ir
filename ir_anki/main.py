@@ -476,15 +476,11 @@ def _prepare_topics():
     configured_ratio = cfg("topic_item_ratio") or 5
 
     # Compute spacing for the session: items per topic
+    # Always use configured ratio. When items run out, remaining topics
+    # are served back-to-back (the swap logic handles this naturally
+    # because _interleave_topic_queue still has entries).
     global _interleave_spacing
-    n_topics = len(_interleave_topic_queue)
-    if n_topics > 0 and items_due_count > 0:
-        if items_due_count < n_topics * configured_ratio:
-            _interleave_spacing = max(1, items_due_count // n_topics)
-        else:
-            _interleave_spacing = configured_ratio
-    else:
-        _interleave_spacing = configured_ratio
+    _interleave_spacing = configured_ratio
 
     # Start with items_since = spacing so the first card triggers a topic
     _interleave_items_since = _interleave_spacing
@@ -1313,7 +1309,23 @@ class IRManager:
         _on_review_end()
 
     def _on_state_change(self, new_state, old_state):
-        if old_state == "review": _on_review_end()
+        global _interleave_active
+        if old_state == "review":
+            # If items ran out but topics remain, unhide them and continue
+            if _interleave_active and _interleave_topic_queue and new_state == "overview":
+                today = _col_day()
+                for tcid in _interleave_topic_queue:
+                    try:
+                        tc = mw.col.get_card(tcid)
+                        tc.due = today
+                        mw.col.update_card(tc)
+                    except: pass
+                # Disable interleaving — remaining topics will show naturally
+                _interleave_active = False
+                # Go back to review to show the remaining topics
+                mw.moveToState("review")
+                return
+            _on_review_end()
         # Note: _prepare_topics is NOT called here. It's called from
         # _on_show_question on the first card, which ensures topics are
         # hidden BEFORE Anki shows any card. This avoids the race condition
