@@ -803,7 +803,7 @@ def _do_extract(html):
 
 def _cmd_cloze():
     if mw.state != "review": return
-    # Get ONLY the HTML of the selection
+    # Get the HTML of the selection plus surrounding context to find the right occurrence
     js = """(function(){
         var sel=window.getSelection();
         if(!sel||sel.isCollapsed)return JSON.stringify({err:1});
@@ -812,7 +812,22 @@ def _cmd_cloze():
         div.appendChild(range.cloneContents());
         var selHtml=div.innerHTML;
         var selText=sel.toString().trim();
-        return JSON.stringify({selHtml:selHtml,selText:selText});
+        // Get ~40 chars of context before and after the selection
+        var beforeCtx='', afterCtx='';
+        try {
+            var r2=range.cloneRange();
+            // Before context: expand start backwards
+            var startNode=range.startContainer;
+            var fullText=startNode.textContent||'';
+            var startOff=range.startOffset;
+            beforeCtx=fullText.substring(Math.max(0,startOff-40),startOff);
+            // After context: expand end forwards
+            var endNode=range.endContainer;
+            var endText=endNode.textContent||'';
+            var endOff=range.endOffset;
+            afterCtx=endText.substring(endOff,endOff+40);
+        } catch(e){}
+        return JSON.stringify({selHtml:selHtml,selText:selText,before:beforeCtx,after:afterCtx});
     })();"""
     mw.web.evalWithCallback(js, _do_cloze)
 
@@ -824,6 +839,8 @@ def _do_cloze(result):
 
     sel_html = data.get("selHtml", "").strip()
     sel_text = data.get("selText", "").strip()
+    before_ctx = data.get("before", "").strip()
+    after_ctx = data.get("after", "").strip()
     if not sel_html: tooltip("Select text first."); return
 
     card = mw.reviewer.card
@@ -838,20 +855,62 @@ def _do_cloze(result):
     elif parent.fields:
         parent_text = parent.fields[0]
 
-    # SM19 approach: use the FULL text of the parent with the selection clozed.
-    # This avoids sentence-truncation errors and matches SM19 behavior where
-    # the cloze card contains the full extract context.
+    # Find the CORRECT occurrence using surrounding context.
+    # The naive .replace(..., 1) always hits the first occurrence.
+    # We use before/after context to locate the right one.
     import re as _re
+    cloze_marker = "{{c1::" + sel_html + "}}"
+    plain_marker = "{{c1::" + sel_text + "}}"
+
+    def _replace_at_context(text, needle, replacement, before, after):
+        """Replace the occurrence of needle that's closest to the given context."""
+        # Strip HTML from context for matching against both HTML and plain text
+        before_plain = _re.sub(r'<[^>]+>', '', before).strip()[-20:] if before else ""
+        after_plain = _re.sub(r'<[^>]+>', '', after).strip()[:20] if after else ""
+        # Find all occurrences
+        start = 0
+        positions = []
+        while True:
+            idx = text.find(needle, start)
+            if idx == -1:
+                break
+            positions.append(idx)
+            start = idx + 1
+        if not positions:
+            return None
+        if len(positions) == 1:
+            return text[:positions[0]] + replacement + text[positions[0] + len(needle):]
+        # Score each position by context match
+        best_idx = positions[0]
+        best_score = -1
+        text_plain = _re.sub(r'<[^>]+>', '', text)
+        for pos in positions:
+            score = 0
+            # Check before context
+            if before_plain:
+                chunk_before = text[max(0, pos - 40):pos]
+                chunk_before_plain = _re.sub(r'<[^>]+>', '', chunk_before)
+                if before_plain in chunk_before_plain:
+                    score += len(before_plain)
+            # Check after context
+            if after_plain:
+                chunk_after = text[pos + len(needle):pos + len(needle) + 40]
+                chunk_after_plain = _re.sub(r'<[^>]+>', '', chunk_after)
+                if after_plain in chunk_after_plain:
+                    score += len(after_plain)
+            if score > best_score:
+                best_score = score
+                best_idx = pos
+        return text[:best_idx] + replacement + text[best_idx + len(needle):]
+
     if sel_html in parent_text:
-        cloze_text = parent_text.replace(sel_html, "{{c1::" + sel_html + "}}", 1)
+        result = _replace_at_context(parent_text, sel_html, cloze_marker, before_ctx, after_ctx)
+        cloze_text = result if result else parent_text.replace(sel_html, cloze_marker, 1)
     elif sel_text and sel_text in _re.sub(r'<[^>]+>', '', parent_text):
-        # Plain text match — do replacement on the raw HTML by finding the text
-        # within tags. Use a simple approach: replace in stripped text, then
-        # reconstruct. Safer: just use the full parent text with plain cloze.
         plain = _re.sub(r'<[^>]+>', '', parent_text)
-        cloze_text = plain.replace(sel_text, "{{c1::" + sel_text + "}}", 1)
+        result = _replace_at_context(plain, sel_text, plain_marker, before_ctx, after_ctx)
+        cloze_text = result if result else plain.replace(sel_text, plain_marker, 1)
     else:
-        # Fallback: just the selection as cloze
         cloze_text = "{{c1::" + sel_html + "}}"
 
     card = mw.reviewer.card
