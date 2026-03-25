@@ -801,6 +801,42 @@ def _do_extract(html):
     tooltip("Extract created")
 
 
+def _replace_at_context(text, needle, replacement, before, after):
+    """Replace the occurrence of needle closest to the given surrounding context.
+    Used for cloze creation and highlight saving when text appears multiple times."""
+    import re as _re
+    before_plain = _re.sub(r'<[^>]+>', '', before).strip()[-20:] if before else ""
+    after_plain = _re.sub(r'<[^>]+>', '', after).strip()[:20] if after else ""
+    start = 0
+    positions = []
+    while True:
+        idx = text.find(needle, start)
+        if idx == -1:
+            break
+        positions.append(idx)
+        start = idx + 1
+    if not positions:
+        return None
+    if len(positions) == 1:
+        return text[:positions[0]] + replacement + text[positions[0] + len(needle):]
+    best_idx = positions[0]
+    best_score = -1
+    for pos in positions:
+        score = 0
+        if before_plain:
+            chunk = _re.sub(r'<[^>]+>', '', text[max(0, pos - 40):pos])
+            if before_plain in chunk:
+                score += len(before_plain)
+        if after_plain:
+            chunk = _re.sub(r'<[^>]+>', '', text[pos + len(needle):pos + len(needle) + 40])
+            if after_plain in chunk:
+                score += len(after_plain)
+        if score > best_score:
+            best_score = score
+            best_idx = pos
+    return text[:best_idx] + replacement + text[best_idx + len(needle):]
+
+
 def _cmd_cloze():
     if mw.state != "review": return
     # Get the HTML of the selection plus surrounding context to find the right occurrence
@@ -862,47 +898,6 @@ def _do_cloze(result):
     cloze_marker = "{{c1::" + sel_html + "}}"
     plain_marker = "{{c1::" + sel_text + "}}"
 
-    def _replace_at_context(text, needle, replacement, before, after):
-        """Replace the occurrence of needle that's closest to the given context."""
-        # Strip HTML from context for matching against both HTML and plain text
-        before_plain = _re.sub(r'<[^>]+>', '', before).strip()[-20:] if before else ""
-        after_plain = _re.sub(r'<[^>]+>', '', after).strip()[:20] if after else ""
-        # Find all occurrences
-        start = 0
-        positions = []
-        while True:
-            idx = text.find(needle, start)
-            if idx == -1:
-                break
-            positions.append(idx)
-            start = idx + 1
-        if not positions:
-            return None
-        if len(positions) == 1:
-            return text[:positions[0]] + replacement + text[positions[0] + len(needle):]
-        # Score each position by context match
-        best_idx = positions[0]
-        best_score = -1
-        text_plain = _re.sub(r'<[^>]+>', '', text)
-        for pos in positions:
-            score = 0
-            # Check before context
-            if before_plain:
-                chunk_before = text[max(0, pos - 40):pos]
-                chunk_before_plain = _re.sub(r'<[^>]+>', '', chunk_before)
-                if before_plain in chunk_before_plain:
-                    score += len(before_plain)
-            # Check after context
-            if after_plain:
-                chunk_after = text[pos + len(needle):pos + len(needle) + 40]
-                chunk_after_plain = _re.sub(r'<[^>]+>', '', chunk_after)
-                if after_plain in chunk_after_plain:
-                    score += len(after_plain)
-            if score > best_score:
-                best_score = score
-                best_idx = pos
-        return text[:best_idx] + replacement + text[best_idx + len(needle):]
-
     if sel_html in parent_text:
         result = _replace_at_context(parent_text, sel_html, cloze_marker, before_ctx, after_ctx)
         cloze_text = result if result else parent_text.replace(sel_html, cloze_marker, 1)
@@ -950,13 +945,16 @@ def _do_cloze(result):
             r.surroundContents(sp);s.removeAllRanges();
         }}
     }})();""")
-    # Save highlight to the note's Text field
+    # Save highlight to the note's Text field using context-aware replacement
     parent_fnames2 = [f["name"] for f in parent.note_type()["flds"]]
     if "Text" in parent_fnames2:
         old_text = parent["Text"]
         if sel_html in old_text:
             highlighted = f'<span style="background-color:{color};color:#fff">{sel_html}</span>'
-            new_text = old_text.replace(sel_html, highlighted, 1)
+            import re as _re
+            new_text = _replace_at_context(old_text, sel_html, highlighted, before_ctx, after_ctx)
+            if not new_text:
+                new_text = old_text.replace(sel_html, highlighted, 1)
             nid = parent.id
             if nid not in _text_history: _text_history[nid] = []
             _text_history[nid].append(old_text)
