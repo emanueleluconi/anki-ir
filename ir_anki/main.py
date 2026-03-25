@@ -595,26 +595,91 @@ def _on_show_question(card: Card):
         _prepare_topics()
 
     if not _interleave_active:
-        # No interleaving (no topics due or studying sub-deck alone)
+        # No interleaving, but still enforce topic priority order if queue exists
+        if _is_topic_card(card) and _interleave_topic_queue:
+            # Find the next unshown topic from the queue
+            next_cid = None
+            while _interleave_topic_queue:
+                candidate = _interleave_topic_queue[0]
+                if candidate not in _interleave_shown_topics:
+                    next_cid = candidate
+                    break
+                _interleave_topic_queue.pop(0)  # discard already-shown
+
+            if next_cid is None:
+                # Queue exhausted — let Anki show whatever it wants
+                if card.id not in _interleave_shown_topics:
+                    _interleave_shown_topics.add(card.id)
+                    m = get(card.note())
+                    tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+                return
+
+            if card.id in _interleave_shown_topics or card.id != next_cid:
+                # Wrong topic or duplicate — swap with correct one
+                _interleave_topic_queue.pop(0)
+                _interleave_shown_topics.add(next_cid)
+                try:
+                    topic_card = mw.col.get_card(next_cid)
+                    mw.reviewer.card = topic_card
+                    mw.reviewer.card.start_timer()
+                    if _ir_toolbar: _ir_toolbar.setVisible(True)
+                    m = get(topic_card.note())
+                    tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+                    _interleave_swapping = True
+                    mw.reviewer._showQuestion()
+                    _interleave_swapping = False
+                except Exception:
+                    _interleave_swapping = False
+                return
+            # Correct topic
+            _interleave_topic_queue.pop(0)
+            _interleave_shown_topics.add(card.id)
+            m = get(card.note())
+            tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+            return
         if _is_topic_card(card):
             m = get(card.note())
             tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
         return
 
     if _is_topic_card(card):
-        # Check if we already showed this topic (Anki serving a duplicate)
+        # Find the next unshown topic from the queue (skip duplicates safely)
+        next_cid = None
+        while _interleave_topic_queue:
+            candidate = _interleave_topic_queue[0]
+            if candidate not in _interleave_shown_topics:
+                next_cid = candidate
+                break
+            _interleave_topic_queue.pop(0)  # discard already-shown
+
         if card.id in _interleave_shown_topics:
-            # Already shown — skip to next card
-            mw.reviewer.nextCard()
+            # Already shown — swap to next unshown topic or let Anki continue
+            if next_cid is not None:
+                _interleave_topic_queue.pop(0)
+                _interleave_items_since = 0
+                _interleave_shown_topics.add(next_cid)
+                try:
+                    topic_card = mw.col.get_card(next_cid)
+                    mw.reviewer.card = topic_card
+                    mw.reviewer.card.start_timer()
+                    if _ir_toolbar: _ir_toolbar.setVisible(True)
+                    m = get(topic_card.note())
+                    tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+                    _interleave_swapping = True
+                    mw.reviewer._showQuestion()
+                    _interleave_swapping = False
+                except Exception:
+                    _interleave_swapping = False
+            # else: no more topics in queue, just let Anki show whatever it has
             return
 
         # Anki gave us a topic naturally. Check if it's the correct one
-        if _interleave_topic_queue and card.id != _interleave_topic_queue[0]:
-            next_topic_cid = _interleave_topic_queue.pop(0)
+        if next_cid is not None and card.id != next_cid:
+            _interleave_topic_queue.pop(0)
             _interleave_items_since = 0
-            _interleave_shown_topics.add(next_topic_cid)
+            _interleave_shown_topics.add(next_cid)
             try:
-                topic_card = mw.col.get_card(next_topic_cid)
+                topic_card = mw.col.get_card(next_cid)
                 mw.reviewer.card = topic_card
                 mw.reviewer.card.start_timer()
                 if _ir_toolbar: _ir_toolbar.setVisible(True)
@@ -629,8 +694,8 @@ def _on_show_question(card: Card):
         # Correct topic or queue empty — accept it
         _interleave_items_since = 0
         _interleave_shown_topics.add(card.id)
-        try: _interleave_topic_queue.remove(card.id)
-        except ValueError: pass
+        if _interleave_topic_queue and _interleave_topic_queue[0] == card.id:
+            _interleave_topic_queue.pop(0)
         m = get(card.note())
         tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
         return
@@ -643,19 +708,28 @@ def _on_show_question(card: Card):
         return  # no more topics to interleave
 
     if _interleave_items_since >= _interleave_spacing:
-        # Time for a topic! Swap the current card with our next priority topic.
-        next_topic_cid = _interleave_topic_queue.pop(0)
+        # Time for a topic! Find the next unshown topic from the queue.
+        next_cid = None
+        while _interleave_topic_queue:
+            candidate = _interleave_topic_queue[0]
+            if candidate not in _interleave_shown_topics:
+                next_cid = candidate
+                _interleave_topic_queue.pop(0)
+                break
+            _interleave_topic_queue.pop(0)  # discard already-shown
+
+        if next_cid is None:
+            return  # all topics already shown
+
         _interleave_items_since = 0
-        _interleave_shown_topics.add(next_topic_cid)
+        _interleave_shown_topics.add(next_cid)
         try:
-            topic_card = mw.col.get_card(next_topic_cid)
+            topic_card = mw.col.get_card(next_cid)
             mw.reviewer.card = topic_card
             mw.reviewer.card.start_timer()
             if _ir_toolbar: _ir_toolbar.setVisible(True)
             m = get(topic_card.note())
             tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
-            # Use _redraw_current_card which reloads and re-renders without
-            # going through the full nextCard/v3 pipeline
             _interleave_swapping = True
             mw.reviewer._showQuestion()
             _interleave_swapping = False
@@ -664,7 +738,7 @@ def _on_show_question(card: Card):
 
 
 def _on_review_end():
-    global _interleave_active, _interleave_topic_queue, _interleave_swapping, _interleave_spacing, _prepare_done_for_session
+    global _interleave_active, _interleave_topic_queue, _interleave_swapping, _interleave_spacing, _prepare_done_for_session, _interleave_shown_topics
     if _ir_toolbar: _ir_toolbar.setVisible(False)
     # Restore any remaining topics to due=today so they're available
     # if user studies Topics alone or comes back later
@@ -682,8 +756,8 @@ def _on_review_end():
     _interleave_spacing = 5
     _interleave_shown_topics = set()
     _prepare_done_for_session = False
-    # Tell Anki to recalculate deck counts (lighter than mw.reset())
-    if mw.col and _prepare_done_for_session:
+    # Tell Anki to recalculate deck counts
+    if mw.col:
         try: mw.col.reset()
         except: pass
 
@@ -1371,15 +1445,21 @@ class IRManager:
             # If items ran out but topics remain, unhide them and continue
             if _interleave_active and _interleave_topic_queue and new_state == "overview":
                 today = _col_day()
+                # Unhide remaining topics at due=today (no offsets needed —
+                # _prepare_topics will handle ordering via swap on re-entry)
                 for tcid in _interleave_topic_queue:
                     try:
                         tc = mw.col.get_card(tcid)
                         tc.due = today
                         mw.col.update_card(tc)
                     except: pass
-                # Disable interleaving — remaining topics will show naturally
                 _interleave_active = False
-                # Go back to review to show the remaining topics
+                _interleave_topic_queue = []
+                # Reset session flag so _prepare_topics runs on re-entry
+                global _prepare_done_for_session
+                _prepare_done_for_session = False
+                try: mw.col.reset()
+                except: pass
                 mw.moveToState("review")
                 return
             _on_review_end()
