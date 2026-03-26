@@ -1294,7 +1294,7 @@ def _add_menu():
         if shortcut: a.setShortcut(shortcut)
         a.triggered.connect(fn); menu.addAction(a)
 
-    _a("Settings...", show_settings)
+    _a("IR Settings", show_settings)
     menu.addSeparator()
     _a("Prepare Topics", _prepare_topics, cfg("key_prepare"))
     _a("Mercy (Spread Overdue)", lambda: showInfo(f"Mercy: {mercy(cfg('topics_deck'), cfg('mercy_days'))} topics spread."))
@@ -1440,7 +1440,7 @@ class IRManager:
         _on_review_end()
 
     def _on_state_change(self, new_state, old_state):
-        global _interleave_active
+        global _interleave_active, _interleave_topic_queue, _prepare_done_for_session
         if old_state == "review":
             # If items ran out but topics remain, unhide them and continue
             if _interleave_active and _interleave_topic_queue and new_state == "overview":
@@ -1456,7 +1456,6 @@ class IRManager:
                 _interleave_active = False
                 _interleave_topic_queue = []
                 # Reset session flag so _prepare_topics runs on re-entry
-                global _prepare_done_for_session
                 _prepare_done_for_session = False
                 try: mw.col.reset()
                 except: pass

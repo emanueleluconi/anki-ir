@@ -1,8 +1,9 @@
-"""Minimal settings dialog. Keyboard-friendly, no fancy UI."""
+"""Minimal settings dialog. Keyboard-friendly, scrollable."""
 
 from aqt import mw
 from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-                     QSpinBox, QCheckBox, QPushButton, QGroupBox, QFormLayout)
+                     QSpinBox, QCheckBox, QPushButton, QGroupBox, QFormLayout,
+                     QScrollArea, QWidget)
 
 
 def show_settings():
@@ -20,7 +21,7 @@ def show_settings():
         "key_reschedule": "Shift+j", "key_execute_rep": "Shift+r",
         "key_postpone": "Shift+w", "key_done": "Shift+d", "key_forget": "Shift+f",
         "key_later_today": "Shift+l", "key_advance_today": "Shift+a",
-        "key_edit_last": "Shift+e", "key_undo_text": "Ctrl+z",
+        "key_edit_last": "Shift+e", "key_undo_text": "Alt+z",
         "key_prepare": "Ctrl+Shift+p",
         "zotero_library_id": "", "zotero_api_key": "",
         "zotero_import_tag": "imported", "zotero_highlight_color": "#ffd400",
@@ -31,6 +32,13 @@ def show_settings():
     dlg = QDialog(mw)
     dlg.setWindowTitle("Incremental Reading — Settings")
     dlg.setMinimumWidth(480)
+    dlg.setMinimumHeight(400)
+    dlg_layout = QVBoxLayout()
+
+    # Scrollable content area
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    container = QWidget()
     layout = QVBoxLayout()
 
     widgets = {}
@@ -95,12 +103,10 @@ def show_settings():
         ("key_undo_text", "Undo text change", "str"),
         ("key_prepare", "Prepare topics", "str"),
     ])
-
     add_group("Highlight Colors", [
         ("highlight_extract", "Extract highlight", "str"),
         ("highlight_cloze", "Cloze highlight", "str"),
     ])
-
     add_group("Zotero Integration", [
         ("zotero_library_id", "Library ID", "str"),
         ("zotero_api_key", "API Key", "str"),
@@ -108,14 +114,18 @@ def show_settings():
         ("zotero_highlight_color", "Highlight color (extracts)", "str"),
     ])
 
-    # Buttons
+    container.setLayout(layout)
+    scroll.setWidget(container)
+    dlg_layout.addWidget(scroll)
+
+    # Buttons (outside scroll area, always visible)
     btn_row = QHBoxLayout()
     save_btn = QPushButton("Save")
     cancel_btn = QPushButton("Cancel")
     btn_row.addStretch()
     btn_row.addWidget(save_btn)
     btn_row.addWidget(cancel_btn)
-    layout.addLayout(btn_row)
+    dlg_layout.addLayout(btn_row)
 
     def save():
         for k, w in widgets.items():
@@ -130,5 +140,5 @@ def show_settings():
 
     save_btn.clicked.connect(save)
     cancel_btn.clicked.connect(dlg.reject)
-    dlg.setLayout(layout)
+    dlg.setLayout(dlg_layout)
     dlg.exec()
