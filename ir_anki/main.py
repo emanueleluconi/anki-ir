@@ -879,8 +879,17 @@ def _replace_at_context(text, needle, replacement, before, after):
     """Replace the occurrence of needle closest to the given surrounding context.
     Used for cloze creation and highlight saving when text appears multiple times."""
     import re as _re
-    before_plain = _re.sub(r'<[^>]+>', '', before).strip()[-20:] if before else ""
-    after_plain = _re.sub(r'<[^>]+>', '', after).strip()[:20] if after else ""
+    # Strip HTML from context for comparison against both HTML and plain text
+    before_plain = _re.sub(r'<[^>]+>', '', before).strip() if before else ""
+    after_plain = _re.sub(r'<[^>]+>', '', after).strip() if after else ""
+    # Use longer context windows for better matching
+    before_match = before_plain[-30:] if before_plain else ""
+    after_match = after_plain[:30] if after_plain else ""
+
+    # Also prepare a plain-text version of the haystack for context matching
+    text_plain = _re.sub(r'<[^>]+>', '', text)
+
+    # Find all occurrences of needle in the original text
     start = 0
     positions = []
     while True:
@@ -893,18 +902,41 @@ def _replace_at_context(text, needle, replacement, before, after):
         return None
     if len(positions) == 1:
         return text[:positions[0]] + replacement + text[positions[0] + len(needle):]
+
+    # For each position, compute a context match score
+    # We check context in BOTH the raw HTML and the plain-text version
+    needle_plain = _re.sub(r'<[^>]+>', '', needle)
     best_idx = positions[0]
     best_score = -1
     for pos in positions:
         score = 0
-        if before_plain:
-            chunk = _re.sub(r'<[^>]+>', '', text[max(0, pos - 40):pos])
-            if before_plain in chunk:
-                score += len(before_plain)
-        if after_plain:
-            chunk = _re.sub(r'<[^>]+>', '', text[pos + len(needle):pos + len(needle) + 40])
-            if after_plain in chunk:
-                score += len(after_plain)
+        # Check context in raw HTML around this position
+        if before_match:
+            chunk_html = text[max(0, pos - 80):pos]
+            chunk_plain = _re.sub(r'<[^>]+>', '', chunk_html)
+            if before_match in chunk_plain:
+                score += len(before_match) * 2  # strong match
+            elif before_match[-10:] in chunk_plain:
+                score += 5  # partial match
+        if after_match:
+            chunk_html = text[pos + len(needle):pos + len(needle) + 80]
+            chunk_plain = _re.sub(r'<[^>]+>', '', chunk_html)
+            if after_match in chunk_plain:
+                score += len(after_match) * 2
+            elif after_match[:10] in chunk_plain:
+                score += 5
+
+        # Also try matching in the plain-text version to find the corresponding position
+        if before_match or after_match:
+            # Find where this HTML position maps to in plain text
+            plain_before_pos = len(_re.sub(r'<[^>]+>', '', text[:pos]))
+            plain_chunk_before = text_plain[max(0, plain_before_pos - 60):plain_before_pos]
+            plain_chunk_after = text_plain[plain_before_pos + len(needle_plain):plain_before_pos + len(needle_plain) + 60]
+            if before_match and before_match in plain_chunk_before:
+                score += len(before_match)
+            if after_match and after_match in plain_chunk_after:
+                score += len(after_match)
+
         if score > best_score:
             best_score = score
             best_idx = pos
@@ -922,20 +954,40 @@ def _cmd_cloze():
         div.appendChild(range.cloneContents());
         var selHtml=div.innerHTML;
         var selText=sel.toString().trim();
-        // Get ~40 chars of context before and after the selection
+        // Get context by expanding the range to capture surrounding text
         var beforeCtx='', afterCtx='';
         try {
-            var r2=range.cloneRange();
-            // Before context: expand start backwards
-            var startNode=range.startContainer;
-            var fullText=startNode.textContent||'';
-            var startOff=range.startOffset;
-            beforeCtx=fullText.substring(Math.max(0,startOff-40),startOff);
-            // After context: expand end forwards
+            // Walk backwards from selection start to get before context
+            var node=range.startContainer;
+            var offset=range.startOffset;
+            var before='';
+            if(node.nodeType===3){
+                before=node.textContent.substring(Math.max(0,offset-60),offset);
+            }
+            // If not enough, walk to previous siblings
+            if(before.length<30){
+                var prev=node.previousSibling||node.parentNode?.previousSibling;
+                for(var i=0;i<5&&prev&&before.length<60;i++){
+                    before=(prev.textContent||'').slice(-60)+before;
+                    prev=prev.previousSibling||prev.parentNode?.previousSibling;
+                }
+            }
+            beforeCtx=before.slice(-60);
+            // Walk forwards from selection end to get after context
             var endNode=range.endContainer;
-            var endText=endNode.textContent||'';
             var endOff=range.endOffset;
-            afterCtx=endText.substring(endOff,endOff+40);
+            var after='';
+            if(endNode.nodeType===3){
+                after=endNode.textContent.substring(endOff,endOff+60);
+            }
+            if(after.length<30){
+                var next=endNode.nextSibling||endNode.parentNode?.nextSibling;
+                for(var i=0;i<5&&next&&after.length<60;i++){
+                    after=after+(next.textContent||'').substring(0,60);
+                    next=next.nextSibling||next.parentNode?.nextSibling;
+                }
+            }
+            afterCtx=after.substring(0,60);
         } catch(e){}
         return JSON.stringify({selHtml:selHtml,selText:selText,before:beforeCtx,after:afterCtx});
     })();"""
