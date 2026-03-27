@@ -255,6 +255,43 @@ def _save_state(s):
         pass
 
 
+def _clean_annotation_text(text):
+    """Remove duplicate words/phrases caused by Zotero PDF extraction artifacts.
+    
+    Zotero sometimes duplicates bold/italic text or margin labels into the
+    annotation text, producing patterns like:
+      "experimental descriptive models data" (should be "experimental data")
+      "on the other mechanistic models hand" (should be "on the other hand")
+    
+    Strategy: find sequences of 2-4 words that appear twice in close proximity
+    and remove the duplicate occurrence.
+    """
+    if not text:
+        return text
+    words = text.split()
+    if len(words) < 6:
+        return text
+    
+    result = list(words)
+    i = 0
+    while i < len(result) - 3:
+        # Try phrase lengths 2, 3, 4 words
+        for plen in range(2, 5):
+            if i + plen * 2 > len(result):
+                break
+            phrase = result[i:i + plen]
+            # Look for the same phrase starting within the next few words
+            for j in range(i + 1, min(i + plen + 3, len(result) - plen + 1)):
+                candidate = result[j:j + plen]
+                if phrase == candidate:
+                    # Found duplicate — remove the second occurrence
+                    del result[j:j + plen]
+                    break
+        i += 1
+    
+    return " ".join(result)
+
+
 # ============================================================
 # Main sync
 # ============================================================
@@ -356,7 +393,7 @@ def sync():
 
             # Build the text content
             if is_highlight:
-                combined = hl_text
+                combined = _clean_annotation_text(hl_text)
                 if comment:
                     combined += f"<br><br>{comment}"
             else:
