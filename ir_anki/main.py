@@ -54,6 +54,7 @@ _last_created_nid: Optional[int] = None
 _ir_toolbar: Optional[QToolBar] = None
 _text_history: dict = {}  # nid → list of previous Text field values (for undo)
 _created_history: dict = {}  # nid → list of created note IDs (for undo — delete on undo)
+_priority_history: dict = {}  # nid → list of (priority, af) tuples (for undo — restore on undo)
 
 # SM19 interleaving state
 _interleave_topic_queue: list = []   # priority-sorted topic card IDs for this session
@@ -839,6 +840,10 @@ def _do_extract(html):
 
     # SM19: deprioritize parent after extraction
     if pm:
+        # Save priority/AF for undo restoration
+        nid = parent.id
+        if nid not in _priority_history: _priority_history[nid] = []
+        _priority_history[nid].append((pm["p"], pm["af"]))
         pm["af"] = scheduler.parent_af_after_extract(pm["af"])
         pm["p"] = scheduler.parent_priority_after_extract(pm["p"])
         put(parent, pm); mw.col.update_note(parent)
@@ -954,17 +959,44 @@ def _cmd_cloze():
         div.appendChild(range.cloneContents());
         var selHtml=div.innerHTML;
         var selText=sel.toString().trim();
+        
+        // Check if selection contains MathJax elements — extract LaTeX source
+        var mjxEls=div.querySelectorAll('mjx-container, .MathJax, .MathJax_Display, span[data-mathjax-type]');
+        if(mjxEls.length>0){
+            // Walk the original range to find MathJax containers and get their LaTeX
+            var walker=document.createTreeWalker(range.commonAncestorContainer,NodeFilter.SHOW_ELEMENT);
+            var node;
+            while(node=walker.nextNode()){
+                if(!range.intersectsNode(node))continue;
+                var mjx=node.closest&&node.closest('mjx-container,script[type*="math"],.MathJax');
+                if(mjx){
+                    // Try to get LaTeX from the associated script tag or aria-label
+                    var latex=mjx.getAttribute('aria-label')||'';
+                    if(!latex){
+                        var script=mjx.querySelector('script[type*="math"]');
+                        if(script)latex=script.textContent||'';
+                    }
+                    if(!latex&&mjx.previousElementSibling&&mjx.previousElementSibling.tagName==='SCRIPT'){
+                        latex=mjx.previousElementSibling.textContent||'';
+                    }
+                    if(latex){
+                        selText=latex.trim();
+                        selHtml=latex.trim();
+                        break;
+                    }
+                }
+            }
+        }
+        
         // Get context by expanding the range to capture surrounding text
         var beforeCtx='', afterCtx='';
         try {
-            // Walk backwards from selection start to get before context
             var node=range.startContainer;
             var offset=range.startOffset;
             var before='';
             if(node.nodeType===3){
                 before=node.textContent.substring(Math.max(0,offset-60),offset);
             }
-            // If not enough, walk to previous siblings
             if(before.length<30){
                 var prev=node.previousSibling||node.parentNode?.previousSibling;
                 for(var i=0;i<5&&prev&&before.length<60;i++){
@@ -973,7 +1005,6 @@ def _cmd_cloze():
                 }
             }
             beforeCtx=before.slice(-60);
-            // Walk forwards from selection end to get after context
             var endNode=range.endContainer;
             var endOff=range.endOffset;
             var after='';
@@ -1268,7 +1299,8 @@ def _cmd_edit_last():
 
 
 def _cmd_undo_text():
-    """Undo the last text modification (highlight) AND delete the created note."""
+    """Undo the last text modification (highlight) AND delete the created note.
+    Also restores parent priority/AF if it was changed by extraction."""
     card = mw.reviewer.card
     if not card: return
     note = card.note()
@@ -1283,29 +1315,25 @@ def _cmd_undo_text():
     note["Text"] = prev
     mw.col.update_note(note)
 
+    # Restore priority/AF if saved
+    if nid in _priority_history and _priority_history[nid]:
+        old_p, old_af = _priority_history[nid].pop()
+        if is_topic(note):
+            m = get(note)
+            m["p"] = old_p
+            m["af"] = old_af
+            put(note, m)
+            mw.col.update_note(note)
+
     # Delete the created note (cloze or extract) if tracked
     if nid in _created_history and _created_history[nid]:
         created_nid = _created_history[nid].pop()
         if created_nid:
             try:
-                created_note = mw.col.get_note(created_nid)
-                # Remove from parent's children list
-                parent_children = note["ir-children"] if "ir-children" in [f["name"] for f in note.note_type()["flds"]] else None
-                # Remove the child link from the parent's IR-Data
-                el_data = None
-                try:
-                    import json as _json
-                    ir_field = note["IR-Data"]
-                    if ir_field:
-                        el_data = _json.loads(ir_field)
-                except: pass
-                # Delete all cards of the created note, then the note itself
-                cids = [c.id for c in created_note.cards()]
                 mw.col.remove_notes([created_nid])
-                tooltip("Undone (note deleted)")
+                tooltip("Undone (note deleted, priority restored)")
             except Exception:
                 tooltip("Undone (text restored, note deletion failed)")
-            # Refresh the displayed card to show restored text
             mw.reviewer._redraw_current_card()
             return
 
