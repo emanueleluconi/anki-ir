@@ -950,8 +950,8 @@ def _replace_at_context(text, needle, replacement, before, after):
 
 def _cmd_cloze():
     if mw.state != "review": return
-    # Get the HTML of the selection plus surrounding context to find the right occurrence
-    js = """(function(){
+    # Get selection text, HTML, context, AND character offset within the card content
+    js = r"""(function(){
         var sel=window.getSelection();
         if(!sel||sel.isCollapsed)return JSON.stringify({err:1});
         var range=sel.getRangeAt(0);
@@ -960,59 +960,58 @@ def _cmd_cloze():
         var selHtml=div.innerHTML;
         var selText=sel.toString().trim();
         
-        // Check if selection contains MathJax elements — extract LaTeX source
-        var mjxEls=div.querySelectorAll('mjx-container, .MathJax, .MathJax_Display, span[data-mathjax-type]');
-        if(mjxEls.length>0){
-            // Walk the original range to find MathJax containers and get their LaTeX
-            var walker=document.createTreeWalker(range.commonAncestorContainer,NodeFilter.SHOW_ELEMENT);
-            var node;
-            while(node=walker.nextNode()){
-                if(!range.intersectsNode(node))continue;
-                var mjx=node.closest&&node.closest('mjx-container,script[type*="math"],.MathJax');
-                if(mjx){
-                    // Try to get LaTeX from the associated script tag or aria-label
-                    var latex=mjx.getAttribute('aria-label')||'';
-                    if(!latex){
-                        var script=mjx.querySelector('script[type*="math"]');
-                        if(script)latex=script.textContent||'';
-                    }
-                    if(!latex&&mjx.previousElementSibling&&mjx.previousElementSibling.tagName==='SCRIPT'){
-                        latex=mjx.previousElementSibling.textContent||'';
-                    }
-                    if(latex){
-                        selText=latex.trim();
-                        selHtml=latex.trim();
-                        break;
-                    }
-                }
+        // Compute character offset of selection start within the card content
+        // This is the key to finding the correct position in the source text
+        var container=document.getElementById('qa')||document.body;
+        var charOffset=0;
+        var walker=document.createTreeWalker(container,NodeFilter.SHOW_TEXT);
+        var node;
+        var foundStart=false;
+        while(node=walker.nextNode()){
+            if(node===range.startContainer){
+                charOffset+=range.startOffset;
+                foundStart=true;
+                break;
             }
+            charOffset+=(node.textContent||'').length;
         }
+        var startOffset=foundStart?charOffset:0;
         
-        // Get context by expanding the range to capture surrounding text
+        // Also compute end offset
+        charOffset=0;
+        walker=document.createTreeWalker(container,NodeFilter.SHOW_TEXT);
+        var foundEnd=false;
+        while(node=walker.nextNode()){
+            if(node===range.endContainer){
+                charOffset+=range.endOffset;
+                foundEnd=true;
+                break;
+            }
+            charOffset+=(node.textContent||'').length;
+        }
+        var endOffset=foundEnd?charOffset:startOffset+selText.length;
+        
+        // Get context
         var beforeCtx='', afterCtx='';
         try {
-            var node=range.startContainer;
-            var offset=range.startOffset;
+            var sn=range.startContainer;
+            var so=range.startOffset;
             var before='';
-            if(node.nodeType===3){
-                before=node.textContent.substring(Math.max(0,offset-60),offset);
-            }
+            if(sn.nodeType===3) before=sn.textContent.substring(Math.max(0,so-60),so);
             if(before.length<30){
-                var prev=node.previousSibling||node.parentNode?.previousSibling;
+                var prev=sn.previousSibling||sn.parentNode?.previousSibling;
                 for(var i=0;i<5&&prev&&before.length<60;i++){
                     before=(prev.textContent||'').slice(-60)+before;
                     prev=prev.previousSibling||prev.parentNode?.previousSibling;
                 }
             }
             beforeCtx=before.slice(-60);
-            var endNode=range.endContainer;
-            var endOff=range.endOffset;
+            var en=range.endContainer;
+            var eo=range.endOffset;
             var after='';
-            if(endNode.nodeType===3){
-                after=endNode.textContent.substring(endOff,endOff+60);
-            }
+            if(en.nodeType===3) after=en.textContent.substring(eo,eo+60);
             if(after.length<30){
-                var next=endNode.nextSibling||endNode.parentNode?.nextSibling;
+                var next=en.nextSibling||en.parentNode?.nextSibling;
                 for(var i=0;i<5&&next&&after.length<60;i++){
                     after=after+(next.textContent||'').substring(0,60);
                     next=next.nextSibling||next.parentNode?.nextSibling;
@@ -1020,7 +1019,7 @@ def _cmd_cloze():
             }
             afterCtx=after.substring(0,60);
         } catch(e){}
-        return JSON.stringify({selHtml:selHtml,selText:selText,before:beforeCtx,after:afterCtx});
+        return JSON.stringify({selHtml:selHtml,selText:selText,before:beforeCtx,after:afterCtx,startOffset:startOffset,endOffset:endOffset});
     })();"""
     mw.web.evalWithCallback(js, _do_cloze)
 
@@ -1034,13 +1033,14 @@ def _do_cloze(result):
     sel_text = data.get("selText", "").strip()
     before_ctx = data.get("before", "").strip()
     after_ctx = data.get("after", "").strip()
-    if not sel_html: tooltip("Select text first."); return
+    start_offset = data.get("startOffset", 0)
+    end_offset = data.get("endOffset", 0)
+    if not sel_html and not sel_text: tooltip("Select text first."); return
 
     card = mw.reviewer.card
     if not card: return
     parent = card.note()
 
-    # Get the Text field content directly from the note (not rendered card)
     parent_fnames = [f["name"] for f in parent.note_type()["flds"]]
     parent_text = ""
     if "Text" in parent_fnames:
@@ -1048,22 +1048,168 @@ def _do_cloze(result):
     elif parent.fields:
         parent_text = parent.fields[0]
 
-    # Find the CORRECT occurrence using surrounding context.
-    # The naive .replace(..., 1) always hits the first occurrence.
-    # We use before/after context to locate the right one.
     import re as _re
-    cloze_marker = "{{c1::" + sel_html + "}}"
-    plain_marker = "{{c1::" + sel_text + "}}"
-
+    
+    # Strip HTML to get plain text for matching
+    plain_parent = _re.sub(r'<[^>]+>', '', parent_text)
+    
+    # Determine the keyword to use for the cloze
+    keyword = None
+    
     if sel_html in parent_text:
-        result = _replace_at_context(parent_text, sel_html, cloze_marker, before_ctx, after_ctx)
-        cloze_text = result if result else parent_text.replace(sel_html, cloze_marker, 1)
-    elif sel_text and sel_text in _re.sub(r'<[^>]+>', '', parent_text):
-        plain = _re.sub(r'<[^>]+>', '', parent_text)
-        result = _replace_at_context(plain, sel_text, plain_marker, before_ctx, after_ctx)
-        cloze_text = result if result else plain.replace(sel_text, plain_marker, 1)
+        keyword = sel_html
+    elif sel_text and sel_text in plain_parent:
+        keyword = sel_text
+    elif sel_text and sel_text in parent_text:
+        keyword = sel_text
     else:
-        cloze_text = "{{c1::" + sel_html + "}}"
+        # Selection likely contains rendered math — the sel_text has Unicode symbols
+        # but the source has \(...\) LaTeX. We need to find the original source text.
+        #
+        # Strategy: split sel_text into plain-text fragments (non-math parts) and
+        # use them as anchors to find the region in the source text.
+        # Then expand to include any \(...\) or \[...\] blocks in between.
+        
+        # Extract plain text fragments from the selection (words that aren't math symbols)
+        plain_fragments = [w for w in sel_text.split() if all(ord(c) < 128 for c in w) and len(w) >= 2]
+        
+        if plain_fragments:
+            # Find the first fragment in the source to get approximate start
+            first_frag = plain_fragments[0]
+            last_frag = plain_fragments[-1] if len(plain_fragments) > 1 else first_frag
+            
+            # Use before_ctx to find the right occurrence of the first fragment
+            start_pos = -1
+            search_from = 0
+            while True:
+                idx = parent_text.find(first_frag, search_from)
+                if idx == -1: break
+                # Check if before_ctx matches
+                chunk_before = parent_text[max(0, idx-60):idx]
+                plain_chunk = _re.sub(r'<[^>]+>', '', chunk_before)
+                if before_ctx and before_ctx[-5:] in plain_chunk:
+                    start_pos = idx
+                    break
+                if start_pos == -1:
+                    start_pos = idx  # fallback to first occurrence
+                search_from = idx + 1
+            
+            if start_pos == -1:
+                start_pos = parent_text.find(first_frag)
+            
+            # Find the last fragment after start_pos to get approximate end
+            end_pos = parent_text.find(last_frag, start_pos)
+            if end_pos >= 0:
+                end_pos += len(last_frag)
+            else:
+                end_pos = start_pos + len(first_frag)
+            
+            # Now expand start_pos backwards and end_pos forwards to include
+            # any \(...\) or \[...\] math blocks that are part of the selection
+            
+            # Expand backwards: if there's a \( before start_pos with no matching \) between
+            before_text = parent_text[:start_pos]
+            last_open = before_text.rfind('\\(')
+            last_close = before_text.rfind('\\)')
+            if last_open > last_close and last_open >= 0:
+                start_pos = last_open
+            
+            # Expand forwards: check if there's a math block starting near end_pos
+            # (the selection included rendered math that follows the plain text)
+            # Skip whitespace, punctuation, AND HTML tags to find nearby math
+            after_text = parent_text[end_pos:]
+            skip = 0
+            while skip < len(after_text):
+                if after_text[skip] == '<':
+                    # Skip HTML tag
+                    close_tag = after_text.find('>', skip)
+                    if close_tag >= 0:
+                        skip = close_tag + 1
+                    else:
+                        break
+                elif after_text[skip] in ' \t\n\r.,;:!?)&':
+                    # Skip whitespace, punctuation, HTML entities start
+                    if after_text[skip] == '&':
+                        # Skip HTML entity like &nbsp;
+                        semi = after_text.find(';', skip)
+                        if semi >= 0 and semi - skip < 10:
+                            skip = semi + 1
+                        else:
+                            skip += 1
+                    else:
+                        skip += 1
+                else:
+                    break
+            nearby = after_text[skip:skip+10]
+            if nearby.startswith('\\(') or nearby.startswith('\\['):
+                delim = '\\)' if nearby.startswith('\\(') else '\\]'
+                close_idx = after_text.find(delim, skip)
+                if close_idx >= 0:
+                    end_pos = end_pos + close_idx + 2
+            
+            # Also expand backwards: check if there's a math block ending near start_pos
+            before_text_b = parent_text[:start_pos]
+            rskip = len(before_text_b) - 1
+            while rskip >= 0:
+                if before_text_b[rskip] == '>':
+                    open_tag = before_text_b.rfind('<', 0, rskip)
+                    if open_tag >= 0:
+                        rskip = open_tag - 1
+                    else:
+                        break
+                elif before_text_b[rskip] in ' \t\n\r.,;:!?(':
+                    rskip -= 1
+                else:
+                    break
+            # Check if text before start ends with \) or \]
+            if rskip >= 1:
+                two_chars = before_text_b[rskip-1:rskip+1]
+                if two_chars == '\\)' or two_chars == '\\]':
+                    delim = '\\(' if two_chars == '\\)' else '\\['
+                    open_idx = before_text_b.rfind(delim, 0, rskip)
+                    if open_idx >= 0:
+                        start_pos = open_idx
+            
+            # Also check for unmatched \( within the current region
+            region = parent_text[start_pos:end_pos]
+            open_count = region.count('\\(') - region.count('\\)')
+            if open_count > 0:
+                rest = parent_text[end_pos:]
+                close_idx = rest.find('\\)')
+                if close_idx >= 0:
+                    end_pos = end_pos + close_idx + 2
+            
+            # Same for \[...\]
+            region = parent_text[start_pos:end_pos]
+            open_d = region.count('\\[') - region.count('\\]')
+            if open_d > 0:
+                after_text = parent_text[end_pos:]
+                close_d = after_text.find('\\]')
+                if close_d >= 0:
+                    end_pos = end_pos + close_d + 2
+            
+            keyword = parent_text[start_pos:end_pos].strip()
+        
+        if not keyword:
+            # Last resort: use the character offsets
+            src_start = min(start_offset, len(parent_text))
+            src_end = min(end_offset, len(parent_text))
+            keyword = parent_text[src_start:src_end].strip()
+    
+    if not keyword:
+        keyword = sel_html or sel_text
+    
+    cloze_marker = "{{c1::" + keyword + "}}"
+    
+    # Build cloze text: the FULL parent text with the keyword wrapped in cloze
+    # This ensures all surrounding context is preserved in the cloze card
+    if keyword in parent_text:
+        cloze_text = _replace_at_context(parent_text, keyword, cloze_marker, before_ctx, after_ctx)
+        if not cloze_text:
+            cloze_text = parent_text.replace(keyword, cloze_marker, 1)
+    else:
+        # Keyword not found in parent_text — use the full parent text with cloze appended
+        cloze_text = parent_text + "\n" + cloze_marker
 
     card = mw.reviewer.card
     if not card: return
@@ -1102,16 +1248,15 @@ def _do_cloze(result):
             r.surroundContents(sp);s.removeAllRanges();
         }}
     }})();""")
-    # Save highlight to the note's Text field using context-aware replacement
+    # Save highlight to the note's Text field using the resolved keyword
     parent_fnames2 = [f["name"] for f in parent.note_type()["flds"]]
     if "Text" in parent_fnames2:
         old_text = parent["Text"]
-        if sel_html in old_text:
-            highlighted = f'<span style="background-color:{color};color:#fff">{sel_html}</span>'
-            import re as _re
-            new_text = _replace_at_context(old_text, sel_html, highlighted, before_ctx, after_ctx)
+        if keyword in old_text:
+            highlighted = f'<span style="background-color:{color};color:#fff">{keyword}</span>'
+            new_text = _replace_at_context(old_text, keyword, highlighted, before_ctx, after_ctx)
             if not new_text:
-                new_text = old_text.replace(sel_html, highlighted, 1)
+                new_text = old_text.replace(keyword, highlighted, 1)
             nid = parent.id
             if nid not in _text_history: _text_history[nid] = []
             _text_history[nid].append(old_text)
