@@ -388,6 +388,9 @@ def sync():
             parent = _bib_parent(key)
             if not parent:
                 continue
+            # Only import extracts whose parent article has the import tag
+            if not any(t.get("tag", "").lower() == import_tag for t in parent["data"].get("tags", [])):
+                continue
             title, year, authors = _item_data(parent["data"])
             ref, tag, _ = _fmt_authors(authors, year, title)
 
@@ -419,6 +422,9 @@ def sync():
 
             parent = _bib_parent(key)
             if not parent:
+                continue
+            # Only import notes whose parent article has the import tag
+            if not any(t.get("tag", "").lower() == import_tag for t in parent["data"].get("tags", [])):
                 continue
             title, year, authors = _item_data(parent["data"])
             ref, tag, _ = _fmt_authors(authors, year, title)

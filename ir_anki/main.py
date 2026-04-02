@@ -72,6 +72,45 @@ def _is_topic_card(card: Card) -> bool:
     except: return False
 
 
+def _update_extract_priorities_proportionally(source_note, old_p: float, new_p: float):
+    """When a source card's priority changes, scale all its extracts proportionally.
+
+    Each extract's new priority = extract_p * (new_p / old_p), clamped to [0, 100].
+    Skips update if old_p is zero (no meaningful ratio) or the change is negligible.
+    """
+    if not mw.col or abs(old_p - new_p) < 0.01 or old_p < 0.01:
+        return
+    ratio = new_p / old_p
+    source_nid = source_note.id
+    source_tag = cfg("source_tag")
+    # Only propagate if this note is actually a source
+    if source_tag not in source_note.tags:
+        return
+    deck = cfg("topics_deck")
+    cids = mw.col.find_cards(f'"deck:{deck}"')
+    seen = set()
+    updated = 0
+    for cid in cids:
+        card = mw.col.get_card(cid)
+        if card.nid in seen:
+            continue
+        seen.add(card.nid)
+        note = mw.col.get_note(card.nid)
+        if not is_topic(note):
+            continue
+        m = get(note)
+        if m.get("pnid", 0) != source_nid:
+            continue
+        new_extract_p = scheduler.clamp_priority(m["p"] * ratio)
+        m["p"] = new_extract_p
+        m["af"] = scheduler.af_from_priority_and_length(new_extract_p, m["tl"])
+        put(note, m)
+        mw.col.update_note(note)
+        updated += 1
+    if updated:
+        tooltip(f"Updated priority on {updated} extract(s) proportionally.")
+
+
 def _col_day() -> int:
     return mw.col.sched.today if mw.col else 0
 
@@ -1272,20 +1311,24 @@ def _cmd_priority():
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): tooltip("Not a topic."); return
     note = card.note(); m = get(note)
+    old_p = m["p"]
     result = ask_priority(m["p"], m["af"], m["iv"])
     if result is not None:
         m["p"] = scheduler.clamp_priority(result)
         m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
         put(note, m); mw.col.update_note(note)
+        _update_extract_priorities_proportionally(note, old_p, m["p"])
         tooltip(f"Priority: {m['p']:.1f}%, AF: {m['af']:.2f}")
 
 def _cmd_quick_priority(delta):
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
     note = card.note(); m = get(note)
+    old_p = m["p"]
     m["p"] = scheduler.clamp_priority(m["p"] + delta)
     m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
     put(note, m); mw.col.update_note(note)
+    _update_extract_priorities_proportionally(note, old_p, m["p"])
     tooltip(f"Priority: {m['p']:.1f}%")
 
 def _cmd_reschedule():
@@ -1756,9 +1799,11 @@ def _browser_set_priority(browser):
     if result is None: return
     for nid, note in topics:
         m = get(note)
+        old_p = m["p"]
         m["p"] = scheduler.clamp_priority(result)
         m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
         put(note, m); mw.col.update_note(note)
+        _update_extract_priorities_proportionally(note, old_p, m["p"])
     tooltip(f"Priority set to {result:.1f}% on {len(topics)} topic(s).")
 
 
