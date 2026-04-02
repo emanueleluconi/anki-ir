@@ -341,7 +341,7 @@ def _prepare_topics():
         card = mw.col.get_card(cid)
         if card.nid in seen: continue
         seen.add(card.nid)
-        note = card.note()
+        note = mw.col.get_note(card.nid)
         if not has_field(note) or is_topic(note): continue
 
         is_extract = extract_tag in note.tags
@@ -368,11 +368,46 @@ def _prepare_topics():
     if new_sources:
         _ask_new_source_priority(new_sources)
         # Count how many were actually initialised (dialog may have been cancelled)
+        # Also build a ref → priority map for sources that were just initialised,
+        # so we can fix up any extracts that were initialised before the source
+        # priority was known (they fell back to default_priority).
+        new_source_ref_to_priority = {}
         for card, note in new_sources:
-            # Re-read note to check if it was initialised
             fresh = mw.col.get_note(note.id)
             if is_topic(fresh):
                 init_count += 1
+                m = get(fresh)
+                fnames = [f["name"] for f in fresh.note_type()["flds"]]
+                if "Reference" in fnames:
+                    ref = fresh["Reference"].strip()
+                    if ref:
+                        new_source_ref_to_priority[ref] = m["p"]
+
+        # Fix up extracts that were just initialised with the wrong priority
+        # because their source wasn't initialised yet when the second pass ran.
+        if new_source_ref_to_priority:
+            seen_fix = set()
+            for cid in mw.col.find_cards(f'"deck:{deck}"'):
+                card = mw.col.get_card(cid)
+                if card.nid in seen_fix: continue
+                seen_fix.add(card.nid)
+                # Always fetch fresh from DB — never use card.note() which may be stale
+                note = mw.col.get_note(card.nid)
+                if not is_topic(note): continue
+                if extract_tag not in note.tags: continue
+                m = get(note)
+                fnames = [f["name"] for f in note.note_type()["flds"]]
+                if "Reference" not in fnames: continue
+                ref = note["Reference"].strip()
+                if ref not in new_source_ref_to_priority: continue
+                correct_p = new_source_ref_to_priority[ref]
+                if abs(m["p"] - correct_p) < 0.01: continue  # already correct
+                # Only update IR-Data — re-fetch to guarantee we have the latest Text field
+                fresh = mw.col.get_note(card.nid)
+                fm = get(fresh)
+                fm["p"] = correct_p
+                fm["af"] = scheduler.af_from_priority_and_length(correct_p, fm["tl"])
+                put(fresh, fm); mw.col.update_note(fresh)
 
     # Step 1b: Link orphan extracts to parent sources and deprioritize parents
     # Handles Zotero-imported extracts (pnid=0). Match by Reference field.
@@ -383,7 +418,7 @@ def _prepare_topics():
         card = mw.col.get_card(cid)
         if card.nid in seen2: continue
         seen2.add(card.nid)
-        note = card.note()
+        note = mw.col.get_note(card.nid)
         if not is_topic(note): continue
         if source_tag in note.tags:
             m = get(note)
@@ -399,7 +434,7 @@ def _prepare_topics():
         card = mw.col.get_card(cid)
         if card.nid in seen2: continue
         seen2.add(card.nid)
-        note = card.note()
+        note = mw.col.get_note(card.nid)
         if not is_topic(note): continue
         m = get(note)
         if extract_tag not in note.tags: continue
@@ -846,7 +881,8 @@ def _do_extract(html):
     html = html.strip()
     card = mw.reviewer.card
     if not card: return
-    parent = card.note()
+    # Fetch parent via get_note for a guaranteed fresh object
+    parent = mw.col.get_note(card.note().id)
     pm = get(parent) if is_topic(parent) else None
 
     model = mw.col.models.by_name(cfg("topic_note_type"))
@@ -1078,7 +1114,9 @@ def _do_cloze(result):
 
     card = mw.reviewer.card
     if not card: return
-    parent = card.note()
+    # Fetch parent once and reuse — never call card.note() twice as the
+    # cache may return a stale object after addNote(), wiping existing highlights
+    parent = mw.col.get_note(card.note().id)
 
     parent_fnames = [f["name"] for f in parent.note_type()["flds"]]
     parent_text = ""
@@ -1252,7 +1290,6 @@ def _do_cloze(result):
 
     card = mw.reviewer.card
     if not card: return
-    parent = card.note()
     model = mw.col.models.by_name(cfg("cloze_note_type"))
     if not model: showInfo(f"Note type '{cfg('cloze_note_type')}' not found."); return
     nn = Note(mw.col, model)
@@ -1572,7 +1609,6 @@ def _add_menu():
     _a("Queue Stats", _show_stats)
     menu.addSeparator()
     _a("Sync from Zotero", _zotero_sync)
-    _a("Reset Zotero Sync", _zotero_reset)
 
 
 def _init_topics():

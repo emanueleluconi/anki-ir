@@ -118,6 +118,20 @@ def show_settings():
     scroll.setWidget(container)
     dlg_layout.addWidget(scroll)
 
+    # Zotero reset (dangerous action — kept separate from Save/Cancel)
+    zotero_reset_btn = QPushButton("Reset Zotero Sync State")
+    zotero_reset_btn.setToolTip("Clears the sync version baseline. Next sync will set a new baseline without re-importing existing notes.")
+    zotero_reset_row = QHBoxLayout()
+    zotero_reset_row.addWidget(zotero_reset_btn)
+    zotero_reset_row.addStretch()
+    dlg_layout.addLayout(zotero_reset_row)
+
+    def do_zotero_reset():
+        from .zotero_sync import reset_state
+        reset_state()
+
+    zotero_reset_btn.clicked.connect(do_zotero_reset)
+
     # Buttons (outside scroll area, always visible)
     btn_row = QHBoxLayout()
     save_btn = QPushButton("Save")

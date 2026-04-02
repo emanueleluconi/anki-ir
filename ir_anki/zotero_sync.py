@@ -158,8 +158,10 @@ def _fmt_authors(authors, year, title):
 def _fmt_math(text):
     if not text:
         return ""
-    text = re.sub(r"\$\$(.*?)\$\$", lambda m: "\\[" + m.group(1) + "\\]", text, flags=re.DOTALL)
-    text = re.sub(r"\$(.*?)\$", lambda m: "\\(" + m.group(1) + "\\)", text)
+    # Display math: $$...$$ → \[...\]  (must run before inline; require non-empty content)
+    text = re.sub(r"\$\$(.+?)\$\$", lambda m: "\\[" + m.group(1) + "\\]", text, flags=re.DOTALL)
+    # Inline math: $...$ → \(...\)  (non-empty, no $ or newline inside to prevent runaway matches)
+    text = re.sub(r"\$([^$\n]+?)\$", lambda m: "\\(" + m.group(1) + "\\)", text)
     ctr = [1]
     def _repl(m):
         inner = m.group(1)
@@ -179,20 +181,65 @@ def _strip_html(h):
     return re.sub(r"<[^>]+>", "", h).replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").strip()
 
 
+def _note_html_to_anki(html):
+    """Convert Zotero note HTML to clean Anki HTML, preserving structure and math.
+
+    Converts block elements (<p>, <h1-6>, <hr>) to line breaks, keeps <b>/<i>,
+    and leaves $...$ math intact for _fmt_math to process.
+    """
+    if not html:
+        return ""
+    # Normalize self-closing <br />
+    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    # Block elements → newline
+    html = re.sub(r"<(p|div|h[1-6]|hr|li|tr)[^>]*>", "\n", html, flags=re.IGNORECASE)
+    html = re.sub(r"</(p|div|h[1-6]|li|tr)>", "\n", html, flags=re.IGNORECASE)
+    # Normalize bold/italic to simple tags
+    html = re.sub(r"<strong[^>]*>", "<b>", html, flags=re.IGNORECASE)
+    html = re.sub(r"</strong>", "</b>", html, flags=re.IGNORECASE)
+    html = re.sub(r"<em[^>]*>", "<i>", html, flags=re.IGNORECASE)
+    html = re.sub(r"</em>", "</i>", html, flags=re.IGNORECASE)
+    # Strip all remaining tags except <b> and <i>
+    html = re.sub(r"<(?!/?[bi]>)[^>]+>", "", html)
+    # Decode entities
+    html = html.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+    # Collapse 3+ newlines to 2
+    html = re.sub(r"\n{3,}", "\n\n", html)
+    # Convert newlines to <br>
+    html = html.replace("\n\n", "<br><br>").replace("\n", "<br>")
+    # Strip leading/trailing breaks
+    html = re.sub(r"^(<br>)+", "", html)
+    html = re.sub(r"(<br>)+$", "", html)
+    return html.strip()
+
+
 # ============================================================
 # Duplicate detection (multi-device safe)
 # ============================================================
 
 def _exists(zotero_key):
     """Check if a note with this Zotero key exists anywhere in the collection.
-    Searches all note fields for the Zotero item key string."""
+
+    Uses two strategies for robustness:
+    1. FTS search (fast, but may miss notes added in the same session before index flush)
+    2. Direct SQL scan of the Back Extra field as a fallback
+    """
     if not mw.col:
         return False
     try:
-        # Search for the raw Zotero key in any field — it's unique enough
-        # and appears in Back Extra as part of SourceID/NoteID links
         nids = mw.col.find_notes(f'"{zotero_key}"')
-        return len(nids) > 0
+        if nids:
+            return True
+    except Exception:
+        pass
+    # Fallback: direct SQL scan — catches notes added in the same session
+    # whose FTS index hasn't been flushed yet
+    try:
+        rows = mw.col.db.list(
+            "SELECT id FROM notes WHERE flds LIKE ?",
+            f"%{zotero_key}%"
+        )
+        return len(rows) > 0
     except Exception:
         return False
 
@@ -264,32 +311,31 @@ def _clean_annotation_text(text):
       "on the other mechanistic models hand" (should be "on the other hand")
     
     Strategy: find sequences of 2-4 words that appear twice in close proximity
-    and remove the duplicate occurrence.
+    and remove the duplicate occurrence. Processed line-by-line to preserve
+    newline structure.
     """
     if not text:
         return text
-    words = text.split()
-    if len(words) < 6:
-        return text
-    
-    result = list(words)
-    i = 0
-    while i < len(result) - 3:
-        # Try phrase lengths 2, 3, 4 words
-        for plen in range(2, 5):
-            if i + plen * 2 > len(result):
-                break
-            phrase = result[i:i + plen]
-            # Look for the same phrase starting within the next few words
-            for j in range(i + 1, min(i + plen + 3, len(result) - plen + 1)):
-                candidate = result[j:j + plen]
-                if phrase == candidate:
-                    # Found duplicate — remove the second occurrence
-                    del result[j:j + plen]
+
+    def _dedup_line(line):
+        words = line.split()
+        if len(words) < 6:
+            return line
+        result = list(words)
+        i = 0
+        while i < len(result) - 3:
+            for plen in range(2, 5):
+                if i + plen * 2 > len(result):
                     break
-        i += 1
-    
-    return " ".join(result)
+                phrase = result[i:i + plen]
+                for j in range(i + 1, min(i + plen + 3, len(result) - plen + 1)):
+                    if result[j:j + plen] == phrase:
+                        del result[j:j + plen]
+                        break
+            i += 1
+        return " ".join(result)
+
+    return "\n".join(_dedup_line(line) for line in text.split("\n"))
 
 
 # ============================================================
@@ -402,7 +448,10 @@ def sync():
             else:
                 # Sticky note: comment is the main content
                 combined = comment
-            combined = combined.replace("\n", "<br>")
+            # \xa0 (non-breaking space) is used by Zotero as a line separator;
+            # strip it before converting newlines so it doesn't swallow breaks
+            combined = combined.replace("\xa0\n", "\n").replace("\xa0", " ")
+            combined = combined.replace("\n\n", "<br><br>").replace("\n", "<br>")
 
             pk = parent["key"]
             back = (f'<a href="zotero://select/library/items/{pk}">SourceID: {pk}</a>'
@@ -414,7 +463,7 @@ def sync():
 
         elif itype == "note":
             note_html = d.get("note", "")
-            plain = _strip_html(note_html).strip()
+            plain = _note_html_to_anki(note_html)
             if not plain:
                 continue
             if _exists(key):
