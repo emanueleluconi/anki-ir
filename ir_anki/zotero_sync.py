@@ -119,10 +119,37 @@ def _item_data(d):
         year = m.group(0)
     authors = []
     for c in d.get("creators", []):
-        n = f"{c.get('firstName', '')} {c.get('lastName', '')}".strip()
-        if n:
-            authors.append(n)
+        # Handle both split (firstName/lastName) and single-field (name) creators.
+        # Single-field names (e.g. YouTube channels, institutions) are kept whole;
+        # split names use lastName for citation shortening.
+        if c.get("name"):
+            authors.append(c["name"].strip())
+        else:
+            last = c.get("lastName", "").strip()
+            first = c.get("firstName", "").strip()
+            n = f"{first} {last}".strip() if first else last
+            if n:
+                authors.append(n)
     return title, year, authors
+
+
+def _last_name(author):
+    """Extract citation-suitable last name from an author string.
+
+    For institutional / channel names that contain common org words,
+    return the full name rather than just the last word.
+    """
+    org_indicators = {"university", "institute", "college", "school", "lab",
+                      "laboratory", "center", "centre", "foundation", "society",
+                      "association", "department", "faculty", "academy", "channel"}
+    words = author.strip().split()
+    if not words:
+        return "Unknown"
+    # If any word in the name is an org indicator, use the full name
+    if any(w.lower() in org_indicators for w in words):
+        return author.strip()
+    # Otherwise use the last word (standard surname extraction)
+    return words[-1]
 
 
 def _fmt_authors(authors, year, title):
@@ -134,7 +161,7 @@ def _fmt_authors(authors, year, title):
                 tw = w[0].upper() + w[1:]
                 break
 
-    lns = [a.strip().split()[-1] for a in authors if a.strip()] or ["Unknown"]
+    lns = [_last_name(a) for a in authors if a.strip()] or ["Unknown"]
     if len(lns) == 1:
         ra = lns[0]
     elif len(lns) == 2:
@@ -402,6 +429,9 @@ def sync():
         yr = f" ({year})" if year else ""
         text = _fmt_math(f"{title}, {ra}{yr}")
         back = f'<a href="zotero://select/library/items/{key}">SourceID: {key}</a>'
+        url = d.get("url", "").strip()
+        if url:
+            back += f'<br><a href="{url}">{url}</a>'
         tags = f"{tag} {src_tag}"
 
         if _create_note(text, ref, back, tags):
