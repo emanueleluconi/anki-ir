@@ -1328,11 +1328,20 @@ def _do_cloze(result):
     parent_fnames2 = [f["name"] for f in parent.note_type()["flds"]]
     if "Text" in parent_fnames2:
         old_text = parent["Text"]
-        if keyword in old_text:
-            highlighted = f'<span style="background-color:{color};color:#fff">{keyword}</span>'
-            new_text = _replace_at_context(old_text, keyword, highlighted, before_ctx, after_ctx)
+        import re as _re
+        # Resolve the keyword to search for in old_text.
+        # If keyword contains HTML (e.g. already-highlighted spans from a previous
+        # cloze on the same note), strip it to get the plain searchable form.
+        search_keyword = keyword
+        if search_keyword not in old_text:
+            plain_kw = _re.sub(r'<[^>]+>', '', keyword).strip()
+            if plain_kw and plain_kw in old_text:
+                search_keyword = plain_kw
+        if search_keyword in old_text:
+            highlighted = f'<span style="background-color:{color};color:#fff">{search_keyword}</span>'
+            new_text = _replace_at_context(old_text, search_keyword, highlighted, before_ctx, after_ctx)
             if not new_text:
-                new_text = old_text.replace(keyword, highlighted, 1)
+                new_text = old_text.replace(search_keyword, highlighted, 1)
             nid = parent.id
             if nid not in _text_history: _text_history[nid] = []
             _text_history[nid].append(old_text)
