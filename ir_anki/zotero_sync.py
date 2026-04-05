@@ -182,30 +182,83 @@ def _fmt_authors(authors, year, title):
     return ref, tag, ra
 
 
+def _md_to_html(text):
+    """Convert common Markdown to HTML. Runs before _fmt_math.
+
+    Handles: headings, bold, italic, hr, blockquotes, unordered lists.
+    Preserves $...$ and $$...$$ math untouched.
+    """
+    if not text:
+        return ""
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        # Headings: ## Title → <b>Title</b>
+        hm = re.match(r"^(#{1,6})\s+(.+)", stripped)
+        if hm:
+            out.append(f"<b>{hm.group(2)}</b>")
+            continue
+        # Horizontal rule
+        if re.match(r"^-{3,}$", stripped) or re.match(r"^\*{3,}$", stripped):
+            out.append("")
+            continue
+        # Blockquote
+        if stripped.startswith("> "):
+            out.append(stripped[2:])
+            continue
+        # Unordered list item
+        lm = re.match(r"^[-*]\s+(.+)", stripped)
+        if lm:
+            out.append(f"• {lm.group(1)}")
+            continue
+        out.append(line)
+    text = "\n".join(out)
+    # Bold: **text** → <b>text</b>
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    # Italic: *text* → <i>text</i>
+    text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", text)
+    return text
+
+
 def _fmt_math(text):
     if not text:
         return ""
     # Display math: $$...$$ → \[...\]  (must run before inline; require non-empty content)
     text = re.sub(r"\$\$(.+?)\$\$", lambda m: "\\[" + m.group(1) + "\\]", text, flags=re.DOTALL)
     # Inline math: $...$ → \(...\)  (non-empty, no $ or newline inside to prevent runaway matches)
-    text = re.sub(r"\$([^$\n]+?)\$", lambda m: "\\(" + m.group(1) + "\\)", text)
-    ctr = [1]
-    def _repl(m):
+    # Inline math: $...$ → \(...\)
+    # Heuristic to avoid matching currency ($100 ... $200):
+    # - Contains a LaTeX command (\word) → definitely math
+    # - Starts with digit(s) then space/comma → likely currency ($100 in...)
+    # - No spaces → single token like $x$, $3$, $u(w)$
+    # - Short with math operators → expression like $x^2 + y^2$
+    def _inline_math(m):
         inner = m.group(1)
-        nm = re.match(r"^(\d+):(.*)", inner)
-        if nm:
-            cid = int(nm.group(1))
-            if cid >= ctr[0]:
-                ctr[0] = cid + 1
-            return "{{c" + str(cid) + "::" + nm.group(2) + "}}"
-        c = ctr[0]; ctr[0] += 1
-        return "{{c" + str(c) + "::" + inner + "}}"
-    text = re.sub(r"\{(.*?)\}", _repl, text)
+        if "\\" in inner:
+            return "\\(" + inner + "\\)"
+        if re.match(r"^\d+[\s,]", inner):
+            return m.group(0)
+        if " " not in inner.strip():
+            return "\\(" + inner + "\\)"
+        if len(inner) <= 30 and re.search(r"[+\-*/^_=<>()]", inner):
+            return "\\(" + inner + "\\)"
+        return m.group(0)
+
+    text = re.sub(r"\$([^$\n]+?)\$", _inline_math, text)
     return text
 
 
 def _strip_html(h):
     return re.sub(r"<[^>]+>", "", h).replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").strip()
+
+
+def _newlines_to_br(text):
+    """Convert newlines to HTML <br> tags and strip leading/trailing breaks."""
+    text = text.replace("\n\n", "<br><br>").replace("\n", "<br>")
+    text = re.sub(r"^(<br>)+", "", text)
+    text = re.sub(r"(<br>)+$", "", text)
+    return text.strip()
 
 
 def _note_html_to_anki(html):
@@ -232,11 +285,9 @@ def _note_html_to_anki(html):
     html = html.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
     # Collapse 3+ newlines to 2
     html = re.sub(r"\n{3,}", "\n\n", html)
-    # Convert newlines to <br>
-    html = html.replace("\n\n", "<br><br>").replace("\n", "<br>")
-    # Strip leading/trailing breaks
-    html = re.sub(r"^(<br>)+", "", html)
-    html = re.sub(r"(<br>)+$", "", html)
+    # Strip leading/trailing whitespace (leave \n intact for _fmt_math)
+    html = re.sub(r"^\n+", "", html)
+    html = re.sub(r"\n+$", "", html)
     return html.strip()
 
 
@@ -481,14 +532,19 @@ def sync():
             # \xa0 (non-breaking space) is used by Zotero as a line separator;
             # strip it before converting newlines so it doesn't swallow breaks
             combined = combined.replace("\xa0\n", "\n").replace("\xa0", " ")
-            combined = combined.replace("\n\n", "<br><br>").replace("\n", "<br>")
+            # Convert Markdown formatting to HTML before math/line break conversion
+            combined = _md_to_html(combined)
+            # Convert math BEFORE \n→<br> so the [^$\n] constraint in the inline
+            # math regex correctly prevents cross-line currency false matches
+            combined = _fmt_math(combined)
+            combined = _newlines_to_br(combined)
 
             pk = parent["key"]
             back = (f'<a href="zotero://select/library/items/{pk}">SourceID: {pk}</a>'
                     f'<br><a href="zotero://select/library/items/{key}">NoteID: {key}</a>')
             tags = f"{tag} {ext_tag}"
 
-            if _create_note(_fmt_math(combined), ref, back, tags):
+            if _create_note(combined, ref, back, tags):
                 extracts += 1
 
         elif itype == "note":
@@ -513,7 +569,7 @@ def sync():
                     f'<br><a href="zotero://select/library/items/{key}">NoteID: {key}</a>')
             tags = f"{tag} {ext_tag}"
 
-            if _create_note(_fmt_math(plain), ref, back, tags):
+            if _create_note(_newlines_to_br(_fmt_math(plain)), ref, back, tags):
                 extracts += 1
 
     state["last_sync"] = cur_ver
