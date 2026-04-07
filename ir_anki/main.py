@@ -61,7 +61,7 @@ _interleave_topic_queue: list = []   # priority-sorted topic card IDs for this s
 _interleave_items_since: int = 0     # items shown since last topic
 _interleave_active: bool = False     # whether interleaving is active this session
 _interleave_swapping: bool = False   # guard against recursive _showQuestion calls
-_interleave_spacing: int = 5         # computed spacing: items per topic for this session
+_interleave_spacing: int = 5         # default spacing, overridden by cfg("topic_item_ratio")
 _interleave_shown_topics: set = set()  # topic card IDs already shown this session
 _postponed_today: bool = False       # track if auto-postpone already ran today
 _prepare_done_for_session: bool = False  # prevent re-running _prepare_topics in same session
@@ -548,7 +548,7 @@ def _prepare_topics():
     # Start with items_since = spacing so the first card triggers a topic
     # if Anki gives us an item. This ensures SM19 behavior: high-priority
     # topic first, then items, then next topic, etc.
-    configured_ratio = cfg("topic_item_ratio") or 5
+    configured_ratio = int(cfg("topic_item_ratio") or 5)
 
     # Compute spacing for the session: items per topic
     # Always use configured ratio. When items run out, remaining topics
@@ -828,7 +828,7 @@ def _on_review_end():
     _interleave_active = False
     _interleave_topic_queue = []
     _interleave_swapping = False
-    _interleave_spacing = 5
+    _interleave_spacing = cfg("topic_item_ratio") or 5
     _interleave_shown_topics = set()
     _prepare_done_for_session = False
     # Tell Anki to recalculate deck counts
