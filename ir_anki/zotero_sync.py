@@ -182,18 +182,58 @@ def _fmt_authors(authors, year, title):
     return ref, tag, ra
 
 
+def _split_table_cells(row):
+    """Split a markdown table row on | delimiters, protecting | inside $...$."""
+    row = row.strip().strip("|")
+    cells = []
+    current = ""
+    in_math = False
+    for ch in row:
+        if ch == "$" and not in_math:
+            in_math = True
+            current += ch
+        elif ch == "$" and in_math:
+            in_math = False
+            current += ch
+        elif ch == "|" and not in_math:
+            cells.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    cells.append(current.strip())
+    return cells
+
+
 def _md_to_html(text):
     """Convert common Markdown to HTML. Runs before _fmt_math.
 
-    Handles: headings, bold, italic, hr, blockquotes, unordered lists.
+    Handles: headings, bold, italic, hr, blockquotes, unordered lists, tables.
     Preserves $...$ and $$...$$ math untouched.
     """
     if not text:
         return ""
     lines = text.split("\n")
     out = []
+    in_table = False
     for line in lines:
         stripped = line.strip()
+
+        # Markdown table row: | col | col |
+        if re.match(r"^\|.*\|$", stripped):
+            # Skip separator rows like |---|---|
+            if re.match(r"^\|[\s\-:|]+\|$", stripped):
+                continue
+            cells = _split_table_cells(stripped)
+            if not in_table:
+                in_table = True
+                out.append("<table>")
+            out.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+            continue
+        else:
+            if in_table:
+                in_table = False
+                out.append("</table>")
+
         # Headings: ## Title → <b>Title</b>
         hm = re.match(r"^(#{1,6})\s+(.+)", stripped)
         if hm:
@@ -213,6 +253,10 @@ def _md_to_html(text):
             out.append(f"• {lm.group(1)}")
             continue
         out.append(line)
+
+    if in_table:
+        out.append("</table>")
+
     text = "\n".join(out)
     # Bold: **text** → <b>text</b>
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)

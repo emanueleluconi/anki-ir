@@ -35,7 +35,7 @@ def cfg(key):
         "topics_deck": "Main::Topics", "items_deck": "Main::Items",
         "topic_note_type": "Extracts", "cloze_note_type": "Cloze",
         "initial_interval": 1, "default_priority": 50, "randomization_degree": 5,
-        "auto_postpone": True, "postpone_protection": 10, "mercy_days": 14,
+        "auto_postpone": False, "postpone_protection": 30, "mercy_days": 14,
         "topic_item_ratio": 5,
         "source_tag": "ir::source", "extract_tag": "ir::extract",
         "highlight_extract": "#5b9bd5", "highlight_cloze": "#c9a227",
@@ -1596,6 +1596,83 @@ def _zotero_reset():
     reset_state()
 
 
+def _import_markdown_source():
+    """Dialog to paste markdown text and create a source topic note."""
+    from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+                         QPlainTextEdit, QPushButton, QShortcut, QKeySequence)
+    from .zotero_sync import _md_to_html, _fmt_math, _newlines_to_br
+
+    if not mw.col:
+        tooltip("No collection open."); return
+
+    model = mw.col.models.by_name(cfg("topic_note_type"))
+    if not model:
+        showInfo(f"Note type '{cfg('topic_note_type')}' not found."); return
+
+    dlg = QDialog(mw)
+    dlg.setWindowTitle("Import Markdown as Source")
+    dlg.setMinimumWidth(600)
+    dlg.setMinimumHeight(500)
+    layout = QVBoxLayout()
+
+    layout.addWidget(QLabel("Reference / Source:"))
+    ref_input = QLineEdit()
+    layout.addWidget(ref_input)
+
+    layout.addWidget(QLabel("Markdown text:"))
+    text_input = QPlainTextEdit()
+    text_input.setPlaceholderText("Paste markdown here...")
+    layout.addWidget(text_input)
+
+    btn_row = QHBoxLayout()
+    import_btn = QPushButton("Import as Source")
+    import_btn.setAutoDefault(False)
+    cancel_btn = QPushButton("Cancel")
+    cancel_btn.setAutoDefault(False)
+    btn_row.addStretch()
+    btn_row.addWidget(import_btn)
+    btn_row.addWidget(cancel_btn)
+    layout.addLayout(btn_row)
+
+    def do_import():
+        raw = text_input.toPlainText().strip()
+        ref = ref_input.text().strip() or "Unknown"
+        if not raw:
+            tooltip("No text to import."); return
+
+        # Convert markdown → HTML → math → br
+        html = _md_to_html(raw)
+        html = _fmt_math(html)
+        html = _newlines_to_br(html)
+
+        deck = cfg("topics_deck")
+        did = mw.col.decks.id_for_name(deck)
+        if did is None:
+            did = mw.col.decks.id_for_name("Default")
+
+        nn = Note(mw.col, model)
+        fnames = [f["name"] for f in model["flds"]]
+        if "Text" in fnames:
+            nn["Text"] = html
+        if "Reference" in fnames:
+            nn["Reference"] = ref
+        # IR-Data left empty — Prepare Topics will initialize it
+        nn.tags = [cfg("source_tag")]
+        nn.note_type()["did"] = did
+        mw.col.addNote(nn)
+        tooltip(f"Source imported. Run Prepare Topics to set priority.")
+        dlg.accept()
+
+    import_btn.clicked.connect(do_import)
+    cancel_btn.clicked.connect(dlg.reject)
+    sc = QShortcut(QKeySequence("Ctrl+Return"), dlg)
+    sc.activated.connect(do_import)
+
+    dlg.setLayout(layout)
+    text_input.setFocus()
+    dlg.exec()
+
+
 # ============================================================
 # Menu
 # ============================================================
@@ -1618,6 +1695,7 @@ def _add_menu():
     _a("Queue Stats", _show_stats)
     menu.addSeparator()
     _a("Sync from Zotero", _zotero_sync)
+    _a("Import Markdown as Source", _import_markdown_source)
 
 
 def _init_topics():
