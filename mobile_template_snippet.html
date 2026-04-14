@@ -1,0 +1,459 @@
+<!-- Hidden fields — paste at END of Back Template -->
+<span id="ir-ref" style="display:none">{{Reference}}</span>
+<span id="ir-back" style="display:none">{{Back Extra}}</span>
+<span id="ir-tags" style="display:none">{{Tags}}</span>
+<span id="ir-text" style="display:none">{{Text}}</span>
+
+<script>
+// Capture the raw source BEFORE MathJax processes it.
+// Anki's template engine converts <anki-mathjax> to \(...\) and \[...\],
+// so IR_RAW_TEXT contains \[v = v_y\] format, not <anki-mathjax> tags.
+var IR_RAW_TEXT=(function(){
+  var el=document.getElementById('ir-text');
+  return el?el.innerHTML.trim():'';
+})();
+
+var IR_TD="Main::Topics",IR_ID="Main::Items";
+var IR_ET="Extracts",IR_CT="Cloze";
+var IR_ST="ir::source",IR_XT="ir::extract";
+var _O=String.fromCharCode(123,123),_C=String.fromCharCode(125,125);
+
+var IR_P=(function(){
+  var cl=document.documentElement.classList;
+  if(cl.contains("android"))return"a";
+  if(cl.contains("iphone")||cl.contains("ipad"))return"i";
+  var ua=navigator.userAgent||"";
+  if(/Android/i.test(ua))return"a";
+  if(/iPhone|iPad|iPod/i.test(ua))return"i";
+  return"d";
+})();
+
+var ankiApi=null;
+if(IR_P==="a"){try{ankiApi=new AnkiDroidJS({version:"0.0.3",developer:"luconiemanuele@icloud.com"});}catch(e){}}
+
+var irLastText=sessionStorage.getItem("irLastText")||"";
+var irSavedRange=null;
+
+document.addEventListener("selectionchange",function(){
+  var s=window.getSelection();
+  if(!s||s.isCollapsed)return;
+  try{irSavedRange=s.getRangeAt(0).cloneRange();}catch(e){}
+});
+
+function irGetRange(){
+  var s=window.getSelection();
+  if(s&&!s.isCollapsed){try{return s.getRangeAt(0);}catch(e){}}
+  if(irSavedRange){var r=irSavedRange;irSavedRange=null;return r;}
+  return null;
+}
+
+function irE(s){return encodeURIComponent(s||"");}
+function irF(id){var e=document.getElementById(id);return e?e.innerHTML.trim():"";}
+function irToast(msg,ms){var d=document.createElement("div");d.style.cssText="position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.85);color:#fff;padding:8px 18px;border-radius:8px;font-size:14px;z-index:99999;pointer-events:none";d.textContent=msg;document.body.appendChild(d);setTimeout(function(){d.remove();},ms||2000);}
+
+function irCreate(type,deck,fields,tags){
+  if(IR_P==="i"){
+    var url="anki://x-callback-url/addnote?type="+irE(type)+"&deck="+irE(deck);
+    for(var k in fields)url+="&fld"+irE(k)+"="+irE(fields[k]);
+    url+="&tags="+irE(tags)+"&dupes=1";
+    var a=document.createElement("a");a.href=url;a.style.display="none";
+    document.body.appendChild(a);a.click();setTimeout(function(){document.body.removeChild(a);},100);
+  }else if(IR_P==="a"){
+    var front=fields["Text"]||"";var extra="";
+    if(fields["Reference"])extra+="Ref: "+fields["Reference"]+"\n";
+    if(fields["Back Extra"])extra+=fields["Back Extra"];
+    var intentUrl="intent:#Intent;action=android.intent.action.SEND;type=text/plain;"
+      +"S.android.intent.extra.SUBJECT="+irE(front)+";"
+      +"S.android.intent.extra.TEXT="+irE(extra)+";"
+      +"package=com.ichi2.anki;end";
+    try{var a=document.createElement("a");a.href=intentUrl;a.style.display="none";
+      document.body.appendChild(a);a.click();setTimeout(function(){document.body.removeChild(a);},100);
+    }catch(e){window.location.href=intentUrl;}
+  }else{
+    if(typeof pycmd==="function")pycmd("ir-create:"+JSON.stringify({type:type,deck:deck,fields:fields,tags:tags}));
+  }
+}
+
+/**
+ * Strip HTML tags from a string to get plain text.
+ */
+function irStripHtml(h){return h.replace(/<[^>]+>/g,'').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"');}
+
+/**
+ * Get the selection's plain text and surrounding context.
+ * On iOS, selection across MathJax may not include the math text,
+ * so we also capture context from the DOM range boundaries.
+ */
+/**
+ * Walk backwards from a node to find the nearest preceding text node,
+ * returning up to `len` trailing characters as context.
+ * Skips MathJax containers since their text content is rendered math symbols
+ * that don't correspond to the source text.
+ */
+function irTextBefore(node,len){
+  var n=node;
+  while(n){
+    // Try previous sibling's deepest last text
+    if(n.previousSibling){
+      n=n.previousSibling;
+      // Skip MathJax containers entirely
+      if(n.tagName&&n.tagName.toLowerCase()==='mjx-container'){continue;}
+      while(n.lastChild){
+        n=n.lastChild;
+        if(n.tagName&&n.tagName.toLowerCase()==='mjx-container'){
+          // Back up and try previous sibling of the mjx-container
+          break;
+        }
+      }
+      if(n.tagName&&n.tagName.toLowerCase()==='mjx-container'){continue;}
+      if(n.nodeType===3&&(n.textContent||'').length>0){
+        var t=n.textContent||'';
+        return t.substring(Math.max(0,t.length-len));
+      }
+      continue;
+    }
+    n=n.parentNode;
+    if(!n||n===document.body)break;
+  }
+  return'';
+}
+
+/**
+ * Walk forwards from a node to find the nearest following text node,
+ * returning up to `len` leading characters as context.
+ * Skips MathJax containers since their text content is rendered math symbols
+ * that don't correspond to the source text.
+ */
+function irTextAfter(node,len){
+  var n=node;
+  while(n){
+    if(n.nextSibling){
+      n=n.nextSibling;
+      // Skip MathJax containers entirely
+      if(n.tagName&&n.tagName.toLowerCase()==='mjx-container'){continue;}
+      while(n.firstChild){
+        n=n.firstChild;
+        if(n.tagName&&n.tagName.toLowerCase()==='mjx-container'){
+          break;
+        }
+      }
+      if(n.tagName&&n.tagName.toLowerCase()==='mjx-container'){continue;}
+      if(n.nodeType===3&&(n.textContent||'').length>0){
+        var t=n.textContent||'';
+        return t.substring(0,len);
+      }
+      continue;
+    }
+    n=n.parentNode;
+    if(!n||n===document.body)break;
+  }
+  return'';
+}
+
+/**
+ * Check if a node is inside a MathJax container.
+ */
+function irInsideMjx(node){
+  var n=node;
+  while(n){
+    if(n.tagName&&n.tagName.toLowerCase()==='mjx-container')return true;
+    n=n.parentNode;
+  }
+  return false;
+}
+
+function irGetSelectionInfo(range){
+  // On iOS, the native selection is often cleared by the time the button
+  // click handler fires, so window.getSelection().toString() returns ''.
+  // Extract text directly from the range instead.
+  var selText='';
+  try{
+    var s=window.getSelection();
+    selText=(s&&!s.isCollapsed)?s.toString():'';
+  }catch(e){}
+  if(!selText){
+    try{
+      var frag=range.cloneContents();
+      var tmp=document.createElement('div');
+      tmp.appendChild(frag);
+      selText=tmp.textContent||tmp.innerText||'';
+    }catch(e){}
+  }
+  selText=selText.trim();
+  var beforeCtx='',afterCtx='';
+  try{
+    var n=range.startContainer;
+    if(n.nodeType===3&&!irInsideMjx(n)){
+      beforeCtx=(n.textContent||'').substring(Math.max(0,range.startOffset-40),range.startOffset);
+    }else{
+      // startContainer is an element or inside MathJax — walk to find preceding text
+      var child=(n.nodeType===3)?n:n.childNodes[range.startOffset];
+      if(child){beforeCtx=irTextBefore(child,40);}
+      else{beforeCtx=irTextBefore(n,40);}
+    }
+    var en=range.endContainer;
+    if(en.nodeType===3&&!irInsideMjx(en)){
+      afterCtx=(en.textContent||'').substring(range.endOffset,range.endOffset+40);
+    }else{
+      // endContainer is an element or inside MathJax — walk to find following text
+      var echild=(en.nodeType===3)?en:en.childNodes[range.endOffset];
+      if(echild){afterCtx=irTextAfter(echild,40);}
+      else{afterCtx=irTextAfter(en,40);}
+    }
+  }catch(e){}
+  return{text:selText,before:beforeCtx,after:afterCtx};
+}
+
+/**
+ * Resolve a selection to the corresponding region in the source Text field.
+ * The source uses \(...\) for inline math and \[...\] for display math.
+ *
+ * Strategy:
+ * 1. Direct match of selection text in source → use it
+ * 2. Find ASCII fragments as anchors in the source plain text
+ * 3. Expand to include complete \(...\) or \[...\] math blocks
+ * 4. Use before/after context to disambiguate multiple matches
+ */
+function irResolveFromSource(srcHtml,selText,beforeCtx,afterCtx){
+  if(!selText)return'';
+  var plainSrc=irStripHtml(srcHtml);
+
+  // Direct match in source HTML
+  if(srcHtml.indexOf(selText)>=0)return selText;
+  // Direct match in plain source
+  if(plainSrc.indexOf(selText)>=0){
+    var idx=plainSrc.indexOf(selText);
+    // Use context to disambiguate
+    if(beforeCtx&&beforeCtx.length>=3){
+      var sf=0;
+      while(true){var ti=plainSrc.indexOf(selText,sf);if(ti===-1)break;
+        var chunk=plainSrc.substring(Math.max(0,ti-50),ti);
+        if(chunk.indexOf(beforeCtx.substring(Math.max(0,beforeCtx.length-10)))>=0){idx=ti;break;}
+        sf=ti+1;}
+    }
+    // Map plain offset back to source HTML offset
+    var result=irPlainToSrcRegion(srcHtml,idx,idx+selText.length);
+    return result;
+  }
+
+  // Fuzzy: use ASCII word fragments as anchors
+  var words=selText.split(/\s+/),frags=[];
+  for(var i=0;i<words.length;i++){var w=words[i];if(w.length>=2){
+    var ok=true;for(var j=0;j<w.length;j++){if(w.charCodeAt(j)>127){ok=false;break;}}
+    if(ok)frags.push(w);}}
+
+  if(!frags.length){
+    // No ASCII fragments — try using context alone
+    if(beforeCtx&&afterCtx){
+      var bi=plainSrc.indexOf(beforeCtx);
+      if(bi>=0){
+        var ai=plainSrc.indexOf(afterCtx,bi+beforeCtx.length);
+        if(ai>=0){
+          var pStart=bi+beforeCtx.length;
+          return irPlainToSrcRegion(srcHtml,pStart,ai);
+        }
+      }
+    }
+    return selText;
+  }
+
+  var first=frags[0],last=frags[frags.length-1];
+  var fi=plainSrc.indexOf(first);
+  if(fi<0)return selText;
+
+  // Context disambiguation
+  if(beforeCtx&&beforeCtx.length>=3){
+    var sf2=0;
+    while(true){var ti2=plainSrc.indexOf(first,sf2);if(ti2===-1)break;
+      var chunk2=plainSrc.substring(Math.max(0,ti2-50),ti2);
+      if(chunk2.indexOf(beforeCtx.substring(Math.max(0,beforeCtx.length-10)))>=0){fi=ti2;break;}
+      sf2=ti2+1;}
+  }
+
+  var li=plainSrc.indexOf(last,fi);
+  var pStart=fi;
+  var pEnd=li>=0?li+last.length:fi+first.length;
+
+  // Use afterCtx to find the true end of the selection.
+  // When the selection contains non-ASCII chars (MathJax-rendered Unicode),
+  // the gap between the last ASCII fragment and afterCtx can be large because
+  // math blocks like \[...\] expand to many plain-text characters.
+  // For pure ASCII selections, keep a tighter cap to avoid over-matching.
+  if(afterCtx&&afterCtx.length>=2){
+    var hasNonAscii=false;
+    for(var ci=0;ci<selText.length;ci++){if(selText.charCodeAt(ci)>127){hasNonAscii=true;break;}}
+    var maxGap=hasNonAscii?500:20;
+    var aSub=afterCtx.substring(0,Math.min(10,afterCtx.length));
+    var ai2=plainSrc.indexOf(aSub,pEnd);
+    if(ai2>=0&&ai2-pEnd<=maxGap)pEnd=ai2;
+  }
+
+  return irPlainToSrcRegion(srcHtml,pStart,pEnd);
+}
+
+/**
+ * Map plain-text start/end offsets back to source HTML, expanding to
+ * include complete math blocks \(...\) and \[...\] that overlap.
+ */
+function irPlainToSrcRegion(srcHtml,plainStart,plainEnd){
+  // Walk source HTML to map plain offsets to source offsets
+  var pi=0,si=0,srcStart=-1,srcEnd=-1;
+  while(si<srcHtml.length){
+    // Skip HTML tags
+    if(srcHtml.charAt(si)==='<'){
+      var gt=srcHtml.indexOf('>',si);
+      if(gt>=0){si=gt+1;continue;}
+    }
+    // Decode entities
+    if(srcHtml.charAt(si)==='&'){
+      var semi=srcHtml.indexOf(';',si);
+      if(semi>=0&&semi-si<10){
+        if(pi===plainStart)srcStart=si;
+        pi++;
+        if(pi===plainEnd)srcEnd=semi+1;
+        si=semi+1;continue;
+      }
+    }
+    if(pi===plainStart)srcStart=si;
+    pi++;
+    si++;
+    if(pi===plainEnd)srcEnd=si;
+  }
+  if(srcStart===-1)srcStart=0;
+  if(srcEnd===-1)srcEnd=srcHtml.length;
+
+  // Expand to include complete \(...\) or \[...\] blocks
+  var result=srcHtml.substring(srcStart,srcEnd);
+  // Check for unmatched \( or \[
+  var openParen=(result.match(/\\\(/g)||[]).length-(result.match(/\\\)/g)||[]).length;
+  if(openParen>0){var rest=srcHtml.substring(srcEnd);var ci=rest.indexOf('\\)');if(ci>=0)srcEnd+=ci+2;}
+  var openBrack=(result.match(/\\\[/g)||[]).length-(result.match(/\\\]/g)||[]).length;
+  if(openBrack>0){var rest2=srcHtml.substring(srcEnd);var ci2=rest2.indexOf('\\]');if(ci2>=0)srcEnd+=ci2+2;}
+  // Check for unmatched closing \) or \] at start
+  result=srcHtml.substring(srcStart,srcEnd);
+  var closeParen=(result.match(/\\\)/g)||[]).length-(result.match(/\\\(/g)||[]).length;
+  if(closeParen>0){var before=srcHtml.substring(0,srcStart);var oi=before.lastIndexOf('\\(');if(oi>=0)srcStart=oi;}
+  var closeBrack=(result.match(/\\\]/g)||[]).length-(result.match(/\\\[/g)||[]).length;
+  if(closeBrack>0){var before2=srcHtml.substring(0,srcStart);var oi2=before2.lastIndexOf('\\[');if(oi2>=0)srcStart=oi2;}
+
+  result=srcHtml.substring(srcStart,srcEnd);
+  // Strip leading/trailing whitespace-only HTML
+  result=result.replace(/^(\s|<br\s*\/?>|&nbsp;)+/gi,'').replace(/(\s|<br\s*\/?>|&nbsp;)+$/gi,'');
+  return result;
+}
+
+/**
+ * When selection spans MathJax (iOS can't include math in selection text),
+ * use before/after context to find the region between them in the source.
+ */
+function irResolveWithContext(srcHtml,beforeCtx,afterCtx){
+  var plainSrc=irStripHtml(srcHtml);
+  // Find beforeCtx in plain source
+  var bLen=Math.min(beforeCtx.length,20);
+  var bSearch=beforeCtx.substring(Math.max(0,beforeCtx.length-bLen));
+  var bi=plainSrc.lastIndexOf(bSearch);
+  if(bi<0&&bSearch.length>5){bSearch=bSearch.substring(bSearch.length-5);bi=plainSrc.lastIndexOf(bSearch);}
+  var pStart=bi>=0?bi+bSearch.length:0;
+
+  // Find afterCtx in plain source after pStart
+  var aLen=Math.min(afterCtx.length,20);
+  var aSearch=afterCtx.substring(0,aLen);
+  var ai=aSearch?plainSrc.indexOf(aSearch,pStart):-1;
+  if(ai<0&&aSearch.length>5){aSearch=aSearch.substring(0,5);ai=plainSrc.indexOf(aSearch,pStart);}
+  var pEnd=ai>=0?ai:plainSrc.length;
+
+  if(pStart>=pEnd)return'';
+  return irPlainToSrcRegion(srcHtml,pStart,pEnd);
+}
+
+function irMakeCloze(fullText,keyword){
+  var clozeKw=_O+"c1::"+keyword+_C;
+  var pos=fullText.indexOf(keyword);
+  if(pos===-1)return clozeKw;
+  return fullText.substring(0,pos)+clozeKw+fullText.substring(pos+keyword.length);
+}
+
+// Action 1: Extract
+var userJs1=function(){
+  var range=irGetRange();
+  if(!range){irToast("Select text first");return;}
+  var fullText=IR_RAW_TEXT;
+  var ref=irF("ir-ref"),back=irF("ir-back");
+  var tags=irF("ir-tags").split(/\s+/).filter(function(t){return t&&t!==IR_ST;});
+  if(tags.indexOf(IR_XT)<0)tags.push(IR_XT);
+  var info=irGetSelectionInfo(range);
+  var selSpansMath=false;
+  try{selSpansMath=!!range.cloneContents().querySelector('mjx-container');}catch(e){}
+  if(!info.text&&!selSpansMath){irToast("Select text first");return;}
+  var extractText;
+  if(selSpansMath){
+    var ctxResult=irResolveWithContext(fullText,info.before,info.after);
+    var srcResult=info.text?irResolveFromSource(fullText,info.text,info.before,info.after):'';
+    // Pick the longer result — the shorter one likely missed math blocks
+    extractText=(srcResult.length>ctxResult.length)?srcResult:ctxResult;
+  }else{
+    extractText=irResolveFromSource(fullText,info.text,info.before,info.after);
+  }
+  if(!extractText){irToast("Could not resolve selection");return;}
+  irLastText=info.text;sessionStorage.setItem("irLastText",info.text);
+  irToast("Extract ✂");
+  setTimeout(function(){irCreate(IR_ET,IR_TD,{"Text":extractText,"Reference":ref,"Back Extra":back},tags.join(" "));},100);
+};
+
+// Action 2: Cloze
+var userJs2=function(){
+  var range=irGetRange();
+  if(!range){irToast("Select keyword first");return;}
+  var fullText=IR_RAW_TEXT;
+  var ref=irF("ir-ref"),back=irF("ir-back");
+  var tags=irF("ir-tags").split(/\s+/).filter(function(t){return t&&t!==IR_ST&&t!==IR_XT;});
+  var info=irGetSelectionInfo(range);
+  // Check if selection spans across MathJax (iOS may not include math in text)
+  var selSpansMath=false;
+  try{var frag=range.cloneContents();selSpansMath=!!frag.querySelector('mjx-container');}catch(e){}
+  if(!info.text&&!selSpansMath){irToast("Select keyword first");return;}
+  var keyword;
+  if(selSpansMath){
+    var ctxResult=irResolveWithContext(fullText,info.before,info.after);
+    var srcResult=info.text?irResolveFromSource(fullText,info.text,info.before,info.after):'';
+    keyword=(srcResult.length>ctxResult.length)?srcResult:ctxResult;
+  }else{
+    keyword=irResolveFromSource(fullText,info.text,info.before,info.after);
+  }
+  if(!keyword){irToast("Could not resolve selection");return;}
+  var cloze=fullText.indexOf(keyword)>=0?irMakeCloze(fullText,keyword):_O+"c1::"+keyword+_C;
+  irLastText=info.text;sessionStorage.setItem("irLastText",info.text);
+  irToast("Cloze 📝");
+  setTimeout(function(){irCreate(IR_CT,IR_ID,{"Text":cloze,"Reference":ref,"Back Extra":back},tags.join(" "));},100);
+};
+
+// Action 3: Find & edit last created
+var userJs3=function(){
+  var q="added:1";
+  var range=irGetRange();
+  var searchText=range?(window.getSelection().toString()||'').substring(0,30):irLastText;
+  if(searchText){var st=searchText.replace(/['"\\]/g,"");q+=' "'+st+'"';}
+  if(IR_P==="i"){
+    var a=document.createElement("a");a.href="anki://x-callback-url/search?query="+irE(q);
+    a.style.display="none";document.body.appendChild(a);a.click();setTimeout(function(){document.body.removeChild(a);},100);
+  }else if(IR_P==="a"){
+    try{navigator.clipboard.writeText(q);}catch(e){
+      var ta=document.createElement("textarea");ta.value=q;ta.style.cssText="position:fixed;left:-9999px";
+      document.body.appendChild(ta);ta.select();document.execCommand("copy");document.body.removeChild(ta);}
+    try{if(ankiApi)ankiApi.ankiSearchCard(q);}catch(e){}
+    irToast("Copied to clipboard. Open Browse and paste.",4000);
+  }else{
+    if(typeof pycmd==="function")pycmd("ir-browse:"+q);
+  }
+};
+
+globalThis["userJs1"]=userJs1;
+globalThis["userJs2"]=userJs2;
+globalThis["userJs3"]=userJs3;
+</script>
+
+<div style="display:flex;gap:6px;justify-content:center;margin-top:16px;padding:8px 0;flex-wrap:wrap">
+  <button onclick="userJs1()" style="padding:8px 14px;border:1px solid #5b9bd5;border-radius:6px;background:transparent;color:#5b9bd5;font-size:13px;cursor:pointer">✂ Extract</button>
+  <button onclick="userJs2()" style="padding:8px 14px;border:1px solid #c9a227;border-radius:6px;background:transparent;color:#c9a227;font-size:13px;cursor:pointer">📝 Cloze</button>
+  <button onclick="userJs3()" style="padding:8px 14px;border:1px solid #888;border-radius:6px;background:transparent;color:#888;font-size:13px;cursor:pointer">🔍 Find</button>
+</div>

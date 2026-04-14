@@ -584,8 +584,12 @@ def sync():
             combined = _newlines_to_br(combined)
 
             pk = parent["key"]
+            # Build open-pdf link: parentItem is the PDF attachment key
+            att_key = d.get("parentItem", "")
+            page = d.get("annotationPageLabel", "")
+            note_url = f"zotero://open-pdf/library/items/{att_key}?page={page}&annotation={key}" if att_key else f"zotero://select/library/items/{key}"
             back = (f'<a href="zotero://select/library/items/{pk}">SourceID: {pk}</a>'
-                    f'<br><a href="zotero://select/library/items/{key}">NoteID: {key}</a>')
+                    f'<br><a href="{note_url}">NoteID: {key}</a>')
             tags = f"{tag} {ext_tag}"
 
             if _create_note(combined, ref, back, tags):
