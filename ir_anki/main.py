@@ -584,7 +584,11 @@ def _custom_answer_card(self, ease, _old):
     if not _is_topic_card(card):
         _old(self, ease); return
 
-    note = card.note(); m = get(note)
+    # Always fetch a fresh note from DB — card.note() returns a cached object
+    # that may be stale if _do_extract / _do_cloze updated the note (e.g. added
+    # highlights to the Text field).  Using the stale cache would overwrite those
+    # changes when we call update_note below.
+    note = mw.col.get_note(card.nid); m = get(note)
     today_iso = date.today().isoformat()
     is_due = not m["due"] or m["due"] <= today_iso
 
@@ -1356,7 +1360,7 @@ def _do_cloze(result):
 def _cmd_priority():
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): tooltip("Not a topic."); return
-    note = card.note(); m = get(note)
+    note = mw.col.get_note(card.nid); m = get(note)
     old_p = m["p"]
     result = ask_priority(m["p"], m["af"], m["iv"])
     if result is not None:
@@ -1369,7 +1373,7 @@ def _cmd_priority():
 def _cmd_quick_priority(delta):
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
-    note = card.note(); m = get(note)
+    note = mw.col.get_note(card.nid); m = get(note)
     old_p = m["p"]
     m["p"] = scheduler.clamp_priority(m["p"] + delta)
     m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
@@ -1381,7 +1385,7 @@ def _cmd_reschedule():
     """SM Ctrl+J: add days to interval. Last review unchanged."""
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
-    note = card.note(); m = get(note)
+    note = mw.col.get_note(card.nid); m = get(note)
     val, ok = getText(f"Add days to interval (current: {m['iv']}d)", title="Reschedule (+days)", default="3")
     if not ok or not val: return
     try: days = int(val)
@@ -1402,7 +1406,7 @@ def _cmd_execute_rep():
     """SM Ctrl+Shift+R: set new interval from today. Last review = today."""
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
-    note = card.note(); m = get(note)
+    note = mw.col.get_note(card.nid); m = get(note)
     val, ok = getText(f"Set new interval from today (current: {m['iv']}d)", title="Execute Repetition", default=str(m["iv"]))
     if not ok or not val: return
     try: days = int(val)
@@ -1422,7 +1426,7 @@ def _cmd_postpone():
     """SM Postpone: multiply interval by 1.5x."""
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
-    note = card.note(); m = get(note)
+    note = mw.col.get_note(card.nid); m = get(note)
     r = scheduler.postpone(m["iv"], m["af"])
     m["due"], m["iv"], m["af"] = r["due"], r["iv"], r["af"]
     put(note, m); mw.col.update_note(note)
@@ -1436,7 +1440,7 @@ def _cmd_later_today():
     The card will reappear later in today's session."""
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
-    note = card.note(); m = get(note)
+    note = mw.col.get_note(card.nid); m = get(note)
     m["due"] = scheduler.today_str()
     # Interval, AF, priority all stay unchanged
     put(note, m); mw.col.update_note(note)
@@ -1453,7 +1457,7 @@ def _cmd_advance_today():
     card = mw.reviewer.card
     if not card or not _is_topic_card(card):
         return
-    note = card.note(); m = get(note)
+    note = mw.col.get_note(card.nid); m = get(note)
     m["due"] = scheduler.today_str()
     m["p"] = scheduler.clamp_priority(max(0, m["p"] - 10))
     m["af"] = scheduler.af_from_priority(m["p"])
@@ -1471,7 +1475,7 @@ def _cmd_advance_today():
 def _cmd_done():
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
-    note = card.note(); m = get(note); m["st"] = "done"
+    note = mw.col.get_note(card.nid); m = get(note); m["st"] = "done"
     put(note, m); mw.col.update_note(note)
     # Suspend all cards of this note (Anki suspend = permanently out of review)
     cids = [c.id for c in note.cards()]
@@ -1484,7 +1488,7 @@ def _cmd_done():
 def _cmd_forget():
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
-    note = card.note(); m = get(note); m["st"] = "forgotten"; m["due"] = None
+    note = mw.col.get_note(card.nid); m = get(note); m["st"] = "forgotten"; m["due"] = None
     put(note, m); mw.col.update_note(note)
     card.type = 2; card.queue = -2; card.due = _col_day() + 9999
     mw.col.update_card(card)
@@ -1537,10 +1541,11 @@ def _cmd_undo_text():
     Also restores parent priority/AF if it was changed by extraction."""
     card = mw.reviewer.card
     if not card: return
-    note = card.note()
-    nid = note.id
+    nid = card.nid
     if nid not in _text_history or not _text_history[nid]:
         tooltip("Nothing to undo."); return
+    # Always fetch fresh from DB to avoid stale cache
+    note = mw.col.get_note(nid)
     fnames = [f["name"] for f in note.note_type()["flds"]]
     if "Text" not in fnames: tooltip("No Text field."); return
 
