@@ -79,6 +79,14 @@ def _is_topic_card(card: Card) -> bool:
     except: return False
 
 
+def _is_topic_card_fresh(card: Card) -> bool:
+    """Like _is_topic_card but always fetches from DB.
+    Use this in command handlers that modify the note, where the
+    card.note() cache may be stale after a prior extract/cloze."""
+    try: return is_topic(mw.col.get_note(card.nid))
+    except: return False
+
+
 def _update_extract_priorities_proportionally(source_note, old_p: float, new_p: float):
     """When a source card's priority changes, scale all its extracts proportionally.
 
@@ -586,7 +594,7 @@ def _prepare_topics():
 
 def _custom_answer_card(self, ease, _old):
     card = self.card
-    if not _is_topic_card(card):
+    if not _is_topic_card_fresh(card):
         _old(self, ease); return
 
     # Fetch fresh from DB to read current metadata
@@ -1584,7 +1592,7 @@ def _do_cloze(result):
 
 def _cmd_priority():
     card = mw.reviewer.card
-    if not card or not _is_topic_card(card): tooltip("Not a topic."); return
+    if not card or not _is_topic_card_fresh(card): tooltip("Not a topic."); return
     note = mw.col.get_note(card.nid); m = get(note)
     old_p = m["p"]
     result = ask_priority(m["p"], m["af"], m["iv"])
@@ -1597,7 +1605,7 @@ def _cmd_priority():
 
 def _cmd_quick_priority(delta):
     card = mw.reviewer.card
-    if not card or not _is_topic_card(card): return
+    if not card or not _is_topic_card_fresh(card): return
     note = mw.col.get_note(card.nid); m = get(note)
     old_p = m["p"]
     m["p"] = scheduler.clamp_priority(m["p"] + delta)
@@ -1609,7 +1617,7 @@ def _cmd_quick_priority(delta):
 def _cmd_reschedule():
     """SM Ctrl+J: add days to interval. Last review unchanged."""
     card = mw.reviewer.card
-    if not card or not _is_topic_card(card): return
+    if not card or not _is_topic_card_fresh(card): return
     note = mw.col.get_note(card.nid); m = get(note)
     val, ok = getText(f"Add days to interval (current: {m['iv']}d)", title="Reschedule (+days)", default="3")
     if not ok or not val: return
@@ -1630,7 +1638,7 @@ def _cmd_reschedule():
 def _cmd_execute_rep():
     """SM Ctrl+Shift+R: set new interval from today. Last review = today."""
     card = mw.reviewer.card
-    if not card or not _is_topic_card(card): return
+    if not card or not _is_topic_card_fresh(card): return
     note = mw.col.get_note(card.nid); m = get(note)
     val, ok = getText(f"Set new interval from today (current: {m['iv']}d)", title="Execute Repetition", default=str(m["iv"]))
     if not ok or not val: return
@@ -1650,7 +1658,7 @@ def _cmd_execute_rep():
 def _cmd_postpone():
     """SM Postpone: multiply interval by 1.5x."""
     card = mw.reviewer.card
-    if not card or not _is_topic_card(card): return
+    if not card or not _is_topic_card_fresh(card): return
     note = mw.col.get_note(card.nid); m = get(note)
     r = scheduler.postpone(m["iv"], m["af"])
     m["due"], m["iv"], m["af"] = r["due"], r["iv"], r["af"]
@@ -1664,7 +1672,7 @@ def _cmd_later_today():
     """SM Ctrl+Shift+J: put back in today's queue without changing interval.
     The card will reappear later in today's session."""
     card = mw.reviewer.card
-    if not card or not _is_topic_card(card): return
+    if not card or not _is_topic_card_fresh(card): return
     note = mw.col.get_note(card.nid); m = get(note)
     m["due"] = scheduler.today_str()
     # Interval, AF, priority all stay unchanged
@@ -1680,7 +1688,7 @@ def _cmd_later_today():
 def _cmd_advance_today():
     """SM Advance: move to today + boost priority by 10%."""
     card = mw.reviewer.card
-    if not card or not _is_topic_card(card):
+    if not card or not _is_topic_card_fresh(card):
         return
     note = mw.col.get_note(card.nid); m = get(note)
     m["due"] = scheduler.today_str()
@@ -1699,25 +1707,36 @@ def _cmd_advance_today():
 
 def _cmd_done():
     card = mw.reviewer.card
-    if not card or not _is_topic_card(card): return
-    note = mw.col.get_note(card.nid); m = get(note); m["st"] = "done"
+    if not card: return
+    # Use fresh DB fetch for the topic check — card.note() cache can be stale
+    # after _do_extract/_do_cloze modified the note via a different object.
+    note = mw.col.get_note(card.nid)
+    if not is_topic(note):
+        tooltip("Not a topic."); return
+    m = get(note); m["st"] = "done"
     save_meta(card.nid, m)
     # Suspend all cards of this note (Anki suspend = permanently out of review)
     cids = [c.id for c in note.cards()]
-    mw.col.sched.suspend_cards(cids)
+    if cids:
+        mw.col.sched.suspend_cards(cids)
     # Remove from interleave queue
+    _interleave_shown_topics.discard(card.id)
     try: _interleave_topic_queue.remove(card.id)
     except ValueError: pass
     tooltip("Done (suspended)"); mw.reviewer.nextCard()
 
 def _cmd_forget():
     card = mw.reviewer.card
-    if not card or not _is_topic_card(card): return
-    note = mw.col.get_note(card.nid); m = get(note); m["st"] = "forgotten"; m["due"] = None
+    if not card: return
+    note = mw.col.get_note(card.nid)
+    if not is_topic(note):
+        tooltip("Not a topic."); return
+    m = get(note); m["st"] = "forgotten"; m["due"] = None
     save_meta(card.nid, m)
     card.type = 2; card.queue = -2; card.due = _col_day() + 9999
     mw.col.update_card(card)
     # Remove from interleave queue
+    _interleave_shown_topics.discard(card.id)
     try: _interleave_topic_queue.remove(card.id)
     except ValueError: pass
     tooltip("Forgotten"); mw.reviewer.nextCard()
