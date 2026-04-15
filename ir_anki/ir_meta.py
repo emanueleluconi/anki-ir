@@ -27,6 +27,19 @@ def put(note, m):
         pass
 
 
+def save_meta(nid, m):
+    """Safely persist IR metadata without touching any other field.
+
+    Always fetches a fresh note from the DB, writes ONLY the IR-Data field,
+    and saves.  This prevents stale Python objects from overwriting content
+    fields (e.g. highlights in Text) that were modified by another code path.
+    """
+    from aqt import mw
+    note = mw.col.get_note(nid)
+    put(note, m)
+    mw.col.update_note(note)
+
+
 def has_field(note):
     try:
         _ = note[IR_FIELD]; return True

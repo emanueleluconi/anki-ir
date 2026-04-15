@@ -28,6 +28,7 @@
     "key_advance_today": "Shift+a",
     "key_edit_last": "Shift+e",
     "key_undo_text": "Alt+z",
+    "key_undo_answer": "Ctrl+z",
     "key_prepare": "Ctrl+Shift+p",
     "zotero_library_id": "",
     "zotero_api_key": "",

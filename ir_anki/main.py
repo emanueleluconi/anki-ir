@@ -21,7 +21,7 @@ from aqt.reviewer import Reviewer
 from aqt.utils import showInfo, tooltip, getText
 
 from . import scheduler
-from .ir_meta import get, put, has_field, is_topic, init_extract, init_source, IR_FIELD
+from .ir_meta import get, has_field, is_topic, init_extract, init_source, save_meta, IR_FIELD
 from .queue import build_queue, auto_postpone, mercy, clean_orphans
 from .priority_dialog import ask_priority
 from .settings_dialog import show_settings
@@ -45,6 +45,7 @@ def cfg(key):
         "key_postpone": "Shift+w", "key_done": "Shift+d", "key_forget": "Shift+f",
         "key_later_today": "Shift+l", "key_advance_today": "Shift+a",
         "key_edit_last": "Shift+e", "key_undo_text": "Alt+z",
+        "key_undo_answer": "Ctrl+z",
         "key_prepare": "Ctrl+Shift+p",
     }
     return c.get(key, defaults.get(key))
@@ -55,6 +56,12 @@ _ir_toolbar: Optional[QToolBar] = None
 _text_history: dict = {}  # nid → list of previous Text field values (for undo)
 _created_history: dict = {}  # nid → list of created note IDs (for undo — delete on undo)
 _priority_history: dict = {}  # nid → list of (priority, af) tuples (for undo — restore on undo)
+
+# Undo-answer stack: each entry is a snapshot of the state before answering a topic
+# dict with keys: nid, cid, meta (IR-Data dict), card_ivl, card_due, card_type, card_queue,
+#                 queue_position (index in _interleave_topic_queue where cid was),
+#                 items_since (value of _interleave_items_since before answer)
+_answer_history: list = []
 
 # SM19 interleaving state
 _interleave_topic_queue: list = []   # priority-sorted topic card IDs for this session
@@ -104,8 +111,7 @@ def _update_extract_priorities_proportionally(source_note, old_p: float, new_p: 
         new_extract_p = scheduler.clamp_priority(m["p"] * ratio)
         m["p"] = new_extract_p
         m["af"] = scheduler.af_from_priority_and_length(new_extract_p, m["tl"])
-        put(note, m)
-        mw.col.update_note(note)
+        save_meta(card.nid, m)
         updated += 1
     if updated:
         tooltip(f"Updated priority on {updated} extract(s) proportionally.")
@@ -281,7 +287,7 @@ def _ask_new_source_priority(sources):
         if due_today:
             m = get(note)
             m["due"] = scheduler.today_str(); m["iv"] = 1
-            put(note, m); mw.col.update_note(note)
+            save_meta(note.id, m)
         _set_review(card, 1, 0 if due_today else 1)
 
 
@@ -402,12 +408,11 @@ def _prepare_topics():
                 if ref not in new_source_ref_to_priority: continue
                 correct_p = new_source_ref_to_priority[ref]
                 if abs(m["p"] - correct_p) < 0.01: continue  # already correct
-                # Only update IR-Data — re-fetch to guarantee we have the latest Text field
-                fresh = mw.col.get_note(card.nid)
-                fm = get(fresh)
+                # Only update IR-Data — save_meta does a fresh DB fetch internally
+                fm = get(mw.col.get_note(card.nid))
                 fm["p"] = correct_p
                 fm["af"] = scheduler.af_from_priority_and_length(correct_p, fm["tl"])
-                put(fresh, fm); mw.col.update_note(fresh)
+                save_meta(card.nid, fm)
 
     # Step 1b: Link orphan extracts to parent sources and deprioritize parents
     # Handles Zotero-imported extracts (pnid=0). Match by Reference field.
@@ -445,7 +450,7 @@ def _prepare_topics():
         if not ref or ref not in ref_to_source_nid: continue
         parent_nid = ref_to_source_nid[ref]
         m["pnid"] = parent_nid
-        put(note, m); mw.col.update_note(note)
+        save_meta(note.id, m)
         new_extract_counts[parent_nid] = new_extract_counts.get(parent_nid, 0) + 1
 
     # SM19: deprioritize parent sources for each new Zotero extract
@@ -456,7 +461,7 @@ def _prepare_topics():
             for _ in range(count):
                 pm["af"] = scheduler.parent_af_after_extract(pm["af"])
                 pm["p"] = scheduler.parent_priority_after_extract(pm["p"])
-            put(pn, pm); mw.col.update_note(pn)
+            save_meta(parent_nid, pm)
         except: pass
 
     # Step 2: Auto-postpone (only once per day to avoid re-postponing on resume)
@@ -584,11 +589,24 @@ def _custom_answer_card(self, ease, _old):
     if not _is_topic_card(card):
         _old(self, ease); return
 
-    # Always fetch a fresh note from DB — card.note() returns a cached object
-    # that may be stale if _do_extract / _do_cloze updated the note (e.g. added
-    # highlights to the Text field).  Using the stale cache would overwrite those
-    # changes when we call update_note below.
+    # Fetch fresh from DB to read current metadata
     note = mw.col.get_note(card.nid); m = get(note)
+
+    # Save a snapshot for undo-answer BEFORE modifying anything
+    _answer_history.append({
+        "nid": card.nid,
+        "cid": card.id,
+        "meta": dict(m),  # copy of IR-Data before answer
+        "card_ivl": card.ivl,
+        "card_due": card.due,
+        "card_type": card.type,
+        "card_queue": card.queue,
+        "items_since": _interleave_items_since,
+    })
+    # Cap history to avoid unbounded memory growth
+    if len(_answer_history) > 50:
+        _answer_history.pop(0)
+
     today_iso = date.today().isoformat()
     is_due = not m["due"] or m["due"] <= today_iso
 
@@ -600,7 +618,9 @@ def _custom_answer_card(self, ease, _old):
         r = scheduler.mid_interval_rep(m["af"], m["rc"])
         m["rc"], m["af"] = r["rc"], r["af"]
 
-    put(note, m); mw.col.update_note(note)
+    # save_meta does a fresh DB fetch internally, so it never overwrites
+    # Text-field highlights that _do_extract/_do_cloze may have saved.
+    save_meta(card.nid, m)
 
     try:
         delta = max(1, (date.fromisoformat(m["due"]) - date.today()).days) if m["due"] else m["iv"]
@@ -648,6 +668,7 @@ def _setup_toolbar():
         (f"Done [{cfg('key_done')}]", _cmd_done),
         (f"Forget [{cfg('key_forget')}]", _cmd_forget),
         (f"Undo [{cfg('key_undo_text')}]", _cmd_undo_text),
+        (f"UndoAns [{cfg('key_undo_answer')}]", _cmd_undo_answer),
         (f"EditLast [{cfg('key_edit_last')}]", _cmd_edit_last),
     ]:
         btn = QToolButton(); btn.setText(label); btn.clicked.connect(fn)
@@ -835,6 +856,7 @@ def _on_review_end():
     _interleave_spacing = cfg("topic_item_ratio") or 5
     _interleave_shown_topics = set()
     _prepare_done_for_session = False
+    _answer_history.clear()
     # Tell Anki to recalculate deck counts
     if mw.col:
         try: mw.col.reset()
@@ -859,6 +881,7 @@ def _set_shortcuts(shortcuts):
         (cfg("key_done"), _cmd_done), (cfg("key_forget"), _cmd_forget),
         (cfg("key_edit_last"), _cmd_edit_last),
         (cfg("key_undo_text"), _cmd_undo_text),
+        (cfg("key_undo_answer"), _cmd_undo_answer),
     ])
 
 
@@ -869,12 +892,64 @@ def _set_shortcuts(shortcuts):
 def _cmd_extract():
     if mw.state != "review": return
     # Get HTML of selection (preserves math, formatting, etc.)
-    js = """(function(){
+    # After cloning, replace rendered MathJax containers with original LaTeX
+    # so the child note stores renderable source, not opaque MathJax DOM.
+    js = r"""(function(){
         var sel=window.getSelection();
         if(!sel||sel.isCollapsed) return '';
         var range=sel.getRangeAt(0);
         var div=document.createElement('div');
         div.appendChild(range.cloneContents());
+
+        // Build a map from rendered <mjx-container> → original LaTeX
+        // MathJax 3 stores items in MathJax.startup.document.math
+        var texMap=new Map();
+        try {
+            var mathDoc=MathJax.startup.document;
+            if(mathDoc && mathDoc.math){
+                for(var item of mathDoc.math){
+                    if(item.typesetRoot){
+                        var delim=item.display?['\\[','\\]']:['\\(','\\)'];
+                        texMap.set(item.typesetRoot, delim[0]+item.math+delim[1]);
+                    }
+                }
+            }
+        } catch(e){}
+
+        // Replace <mjx-container> in the clone with original LaTeX.
+        // The clone's mjx-containers don't have MathJax refs, so we match
+        // them to originals by position within the selection range.
+        var origContainers=[];
+        var walker=document.createTreeWalker(
+            range.commonAncestorContainer.nodeType===1?range.commonAncestorContainer:range.commonAncestorContainer.parentNode,
+            NodeFilter.SHOW_ELEMENT,
+            {acceptNode:function(n){return n.tagName==='MJX-CONTAINER'?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_SKIP;}}
+        );
+        var n;
+        while(n=walker.nextNode()){
+            if(range.intersectsNode(n)) origContainers.push(n);
+        }
+
+        var cloneContainers=div.querySelectorAll('mjx-container');
+        for(var i=0;i<cloneContainers.length;i++){
+            var tex=null;
+            if(i<origContainers.length) tex=texMap.get(origContainers[i]);
+            if(!tex){
+                // Fallback: extract from assistive MathML
+                var mml=cloneContainers[i].querySelector('mjx-assistive-mml math');
+                if(mml){
+                    var isBlock=mml.getAttribute('display')==='block'||
+                                cloneContainers[i].getAttribute('display')==='true';
+                    // Can't perfectly recover LaTeX from MathML, so use a
+                    // simplified text extraction as last resort
+                    tex=(isBlock?'\\[':'\\(')+mml.textContent.trim()+(isBlock?'\\]':'\\)');
+                }
+            }
+            if(tex){
+                cloneContainers[i].replaceWith(document.createTextNode(tex));
+            }
+        }
+
         return div.innerHTML;
     })();"""
     mw.web.evalWithCallback(js, _do_extract)
@@ -886,8 +961,14 @@ def _do_extract(html):
     card = mw.reviewer.card
     if not card: return
     # Fetch parent via get_note for a guaranteed fresh object
-    parent = mw.col.get_note(card.note().id)
+    parent = mw.col.get_note(card.nid)
     pm = get(parent) if is_topic(parent) else None
+
+    # Python-side fallback: if JS failed to convert MathJax containers back
+    # to LaTeX, recover them from the parent note's Text field.
+    parent_fnames_check = [f["name"] for f in parent.note_type()["flds"]]
+    parent_text_for_math = parent["Text"] if "Text" in parent_fnames_check else ""
+    html = _strip_mathjax_html(html, parent_text_for_math)
 
     model = mw.col.models.by_name(cfg("topic_note_type"))
     if not model: showInfo(f"Note type '{cfg('topic_note_type')}' not found."); return
@@ -925,7 +1006,7 @@ def _do_extract(html):
         _priority_history[nid].append((pm["p"], pm["af"]))
         pm["af"] = scheduler.parent_af_after_extract(pm["af"])
         pm["p"] = scheduler.parent_priority_after_extract(pm["p"])
-        put(parent, pm); mw.col.update_note(parent)
+        save_meta(nid, pm)
 
     color = cfg("highlight_extract")
     # Highlight the selection visually in the webview (cosmetic only)
@@ -936,27 +1017,120 @@ def _do_extract(html):
             r.surroundContents(sp);s.removeAllRanges();
         }}
     }})();""")
-    # Save highlight to the note's Text field by replacing the extracted text
-    # with a highlighted version. This avoids saving the entire card HTML
-    # (which would include Reference, Back Extra, etc.)
-    fnames = [f["name"] for f in parent.note_type()["flds"]]
+    # Save highlight to the note's Text field.
+    # Always re-fetch from DB right before writing to guarantee we have the
+    # latest content (other code paths may have touched the note in between).
+    nid = parent.id
+    fresh = mw.col.get_note(nid)
+    fnames = [f["name"] for f in fresh.note_type()["flds"]]
     if "Text" in fnames:
-        old_text = parent["Text"]
-        # Wrap the extracted HTML in a highlight span within the Text field
+        old_text = fresh["Text"]
         import re as _re
         plain_html = html.strip()
-        if plain_html in old_text:
-            highlighted = f'<span style="background-color:{color};color:#fff">{plain_html}</span>'
-            new_text = old_text.replace(plain_html, highlighted, 1)
+        # Try exact HTML match first, then fall back to plain-text match
+        search_text = plain_html
+        if search_text not in old_text:
+            plain_sel = _re.sub(r'<[^>]+>', '', plain_html).strip()
+            if plain_sel and plain_sel in old_text:
+                search_text = plain_sel
+        if search_text in old_text:
+            highlighted = f'<span style="background-color:{color};color:#fff">{search_text}</span>'
+            new_text = old_text.replace(search_text, highlighted, 1)
             # Save for undo
-            nid = parent.id
             if nid not in _text_history: _text_history[nid] = []
             _text_history[nid].append(old_text)
             if nid not in _created_history: _created_history[nid] = []
             _created_history[nid].append(_last_created_nid)
-            parent["Text"] = new_text
-            mw.col.update_note(parent)
+            fresh["Text"] = new_text
+            mw.col.update_note(fresh)
     tooltip("Extract created")
+
+
+def _strip_mathjax_html(html, parent_text=""):
+    """Replace leftover rendered MathJax DOM (<mjx-container>) with original LaTeX.
+
+    The JS-side recovery handles most cases via MathJax.startup.document.math,
+    but if that fails (e.g. MathJax not loaded yet, partial selection) this
+    Python fallback kicks in.
+
+    Strategy:
+    1. Extract plain-text anchors around each <mjx-container> in the HTML.
+    2. Find the corresponding region in parent_text (which has the original
+       \\(...\\) or \\[...\\] LaTeX).
+    3. Replace the <mjx-container>...</mjx-container> with the original LaTeX.
+    """
+    import re as _re
+    if '<mjx-container' not in html:
+        return html  # nothing to do
+
+    # Pattern to match an entire <mjx-container ...>...</mjx-container>
+    mjx_pat = _re.compile(r'<mjx-container[^>]*>.*?</mjx-container>', _re.DOTALL)
+
+    if not parent_text:
+        # No parent text to recover from — strip MathJax containers entirely
+        # and leave a placeholder so the user knows something was there
+        return mjx_pat.sub('[math]', html)
+
+    # Build a list of LaTeX expressions in the parent text
+    # Matches \(...\) and \[...\] (non-greedy)
+    latex_inline = list(_re.finditer(r'\\\(.*?\\\)', parent_text, _re.DOTALL))
+    latex_display = list(_re.finditer(r'\\\[.*?\\\]', parent_text, _re.DOTALL))
+    all_latex = sorted(latex_inline + latex_display, key=lambda m: m.start())
+    if not all_latex:
+        return mjx_pat.sub('[math]', html)
+
+    # For each <mjx-container>, try to match it to a LaTeX expression
+    # by looking at the plain text before/after it in the HTML
+    result = html
+    used = set()
+    for mjx_match in list(mjx_pat.finditer(html)):
+        # Get plain text before and after this mjx-container in the HTML
+        before_html = html[:mjx_match.start()]
+        after_html = html[mjx_match.end():]
+        before_plain = _re.sub(r'<[^>]+>', '', before_html).strip()[-40:]
+        after_plain = _re.sub(r'<[^>]+>', '', after_html).strip()[:40]
+
+        # Also check if it's display math from the container attributes
+        is_display = 'display="true"' in mjx_match.group() or 'display="block"' in mjx_match.group()
+
+        best_match = None
+        best_score = -1
+        for i, lm in enumerate(all_latex):
+            if i in used:
+                continue
+            # Check type match
+            is_lm_display = lm.group().startswith('\\[')
+            if is_display != is_lm_display:
+                continue
+            score = 0
+            # Check surrounding text in parent
+            pt_before = parent_text[max(0, lm.start()-50):lm.start()]
+            pt_before_plain = _re.sub(r'<[^>]+>', '', pt_before).strip()[-40:]
+            pt_after = parent_text[lm.end():lm.end()+50]
+            pt_after_plain = _re.sub(r'<[^>]+>', '', pt_after).strip()[:40]
+            if before_plain and pt_before_plain:
+                overlap = min(len(before_plain), len(pt_before_plain), 20)
+                if before_plain[-overlap:] == pt_before_plain[-overlap:]:
+                    score += overlap * 2
+            if after_plain and pt_after_plain:
+                overlap = min(len(after_plain), len(pt_after_plain), 20)
+                if after_plain[:overlap] == pt_after_plain[:overlap]:
+                    score += overlap * 2
+            if score > best_score:
+                best_score = score
+                best_match = (i, lm)
+
+        if best_match and best_score > 0:
+            used.add(best_match[0])
+            result = result.replace(mjx_match.group(), best_match[1].group(), 1)
+        elif not used and len(all_latex) == 1:
+            # Only one LaTeX expression and one mjx-container — safe to match
+            used.add(0)
+            result = result.replace(mjx_match.group(), all_latex[0].group(), 1)
+
+    # If any mjx-containers remain, strip them as last resort
+    result = mjx_pat.sub('[math]', result)
+    return result
 
 
 def _replace_at_context(text, needle, replacement, before, after):
@@ -1029,13 +1203,58 @@ def _replace_at_context(text, needle, replacement, before, after):
 
 def _cmd_cloze():
     if mw.state != "review": return
-    # Get selection text, HTML, context, AND character offset within the card content
+    # Get selection text, HTML, context, AND character offset within the card content.
+    # After cloning, replace rendered MathJax containers with original LaTeX
+    # so the child cloze note stores renderable source, not opaque MathJax DOM.
     js = r"""(function(){
         var sel=window.getSelection();
         if(!sel||sel.isCollapsed)return JSON.stringify({err:1});
         var range=sel.getRangeAt(0);
         var div=document.createElement('div');
         div.appendChild(range.cloneContents());
+
+        // Build a map from rendered <mjx-container> → original LaTeX
+        var texMap=new Map();
+        try {
+            var mathDoc=MathJax.startup.document;
+            if(mathDoc && mathDoc.math){
+                for(var item of mathDoc.math){
+                    if(item.typesetRoot){
+                        var delim=item.display?['\\[','\\]']:['\\(','\\)'];
+                        texMap.set(item.typesetRoot, delim[0]+item.math+delim[1]);
+                    }
+                }
+            }
+        } catch(e){}
+
+        // Match cloned mjx-containers to originals by position in selection
+        var origContainers=[];
+        var tw=document.createTreeWalker(
+            range.commonAncestorContainer.nodeType===1?range.commonAncestorContainer:range.commonAncestorContainer.parentNode,
+            NodeFilter.SHOW_ELEMENT,
+            {acceptNode:function(n){return n.tagName==='MJX-CONTAINER'?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_SKIP;}}
+        );
+        var n;
+        while(n=tw.nextNode()){
+            if(range.intersectsNode(n)) origContainers.push(n);
+        }
+        var cloneContainers=div.querySelectorAll('mjx-container');
+        for(var i=0;i<cloneContainers.length;i++){
+            var tex=null;
+            if(i<origContainers.length) tex=texMap.get(origContainers[i]);
+            if(!tex){
+                var mml=cloneContainers[i].querySelector('mjx-assistive-mml math');
+                if(mml){
+                    var isBlock=mml.getAttribute('display')==='block'||
+                                cloneContainers[i].getAttribute('display')==='true';
+                    tex=(isBlock?'\\[':'\\(')+mml.textContent.trim()+(isBlock?'\\]':'\\)');
+                }
+            }
+            if(tex){
+                cloneContainers[i].replaceWith(document.createTextNode(tex));
+            }
+        }
+
         var selHtml=div.innerHTML;
         var selText=sel.toString().trim();
         
@@ -1118,9 +1337,8 @@ def _do_cloze(result):
 
     card = mw.reviewer.card
     if not card: return
-    # Fetch parent once and reuse — never call card.note() twice as the
-    # cache may return a stale object after addNote(), wiping existing highlights
-    parent = mw.col.get_note(card.note().id)
+    # Fetch parent once — always from DB, never from card.note() cache
+    parent = mw.col.get_note(card.nid)
 
     parent_fnames = [f["name"] for f in parent.note_type()["flds"]]
     parent_text = ""
@@ -1128,6 +1346,10 @@ def _do_cloze(result):
         parent_text = parent["Text"]
     elif parent.fields:
         parent_text = parent.fields[0]
+
+    # Python-side fallback: if JS failed to convert MathJax containers back
+    # to LaTeX, recover them from the parent note's Text field.
+    sel_html = _strip_mathjax_html(sel_html, parent_text)
 
     import re as _re
     
@@ -1328,10 +1550,14 @@ def _do_cloze(result):
             r.surroundContents(sp);s.removeAllRanges();
         }}
     }})();""")
-    # Save highlight to the note's Text field using the resolved keyword
-    parent_fnames2 = [f["name"] for f in parent.note_type()["flds"]]
-    if "Text" in parent_fnames2:
-        old_text = parent["Text"]
+    # Save highlight to the note's Text field using the resolved keyword.
+    # Always re-fetch from DB right before writing to guarantee we have the
+    # latest content (other code paths may have touched the note in between).
+    nid = parent.id
+    fresh = mw.col.get_note(nid)
+    fresh_fnames = [f["name"] for f in fresh.note_type()["flds"]]
+    if "Text" in fresh_fnames:
+        old_text = fresh["Text"]
         import re as _re
         # Resolve the keyword to search for in old_text.
         # If keyword contains HTML (e.g. already-highlighted spans from a previous
@@ -1346,13 +1572,12 @@ def _do_cloze(result):
             new_text = _replace_at_context(old_text, search_keyword, highlighted, before_ctx, after_ctx)
             if not new_text:
                 new_text = old_text.replace(search_keyword, highlighted, 1)
-            nid = parent.id
             if nid not in _text_history: _text_history[nid] = []
             _text_history[nid].append(old_text)
             if nid not in _created_history: _created_history[nid] = []
             _created_history[nid].append(_last_created_nid)
-            parent["Text"] = new_text
-            mw.col.update_note(parent)
+            fresh["Text"] = new_text
+            mw.col.update_note(fresh)
     tooltip("Cloze created (tomorrow)")
 
 
@@ -1366,7 +1591,7 @@ def _cmd_priority():
     if result is not None:
         m["p"] = scheduler.clamp_priority(result)
         m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
-        put(note, m); mw.col.update_note(note)
+        save_meta(card.nid, m)
         _update_extract_priorities_proportionally(note, old_p, m["p"])
         tooltip(f"Priority: {m['p']:.1f}%, AF: {m['af']:.2f}")
 
@@ -1377,7 +1602,7 @@ def _cmd_quick_priority(delta):
     old_p = m["p"]
     m["p"] = scheduler.clamp_priority(m["p"] + delta)
     m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
-    put(note, m); mw.col.update_note(note)
+    save_meta(card.nid, m)
     _update_extract_priorities_proportionally(note, old_p, m["p"])
     tooltip(f"Priority: {m['p']:.1f}%")
 
@@ -1396,7 +1621,7 @@ def _cmd_reschedule():
     m["p"] = scheduler.adjust_priority_on_interval(m["p"], m["iv"], m["af"], r["iv"])
     m["due"], m["iv"] = r["due"], r["iv"]
     # Note: lr (last review) NOT updated — this is the key SM Ctrl+J behavior
-    put(note, m); mw.col.update_note(note)
+    save_meta(card.nid, m)
     _set_review(card, m["iv"], days)
     try: _interleave_topic_queue.remove(card.id)
     except ValueError: pass
@@ -1416,7 +1641,7 @@ def _cmd_execute_rep():
     m["p"] = scheduler.adjust_priority_on_interval(m["p"], m["iv"], m["af"], days)
     m["due"] = scheduler.date_from_days(days); m["iv"] = days
     m["lr"] = scheduler.today_str(); m["rc"] += 1
-    put(note, m); mw.col.update_note(note)
+    save_meta(card.nid, m)
     _set_review(card, days, days)
     try: _interleave_topic_queue.remove(card.id)
     except ValueError: pass
@@ -1429,7 +1654,7 @@ def _cmd_postpone():
     note = mw.col.get_note(card.nid); m = get(note)
     r = scheduler.postpone(m["iv"], m["af"])
     m["due"], m["iv"], m["af"] = r["due"], r["iv"], r["af"]
-    put(note, m); mw.col.update_note(note)
+    save_meta(card.nid, m)
     _set_review(card, r["iv"], r["iv"])
     try: _interleave_topic_queue.remove(card.id)
     except ValueError: pass
@@ -1443,7 +1668,7 @@ def _cmd_later_today():
     note = mw.col.get_note(card.nid); m = get(note)
     m["due"] = scheduler.today_str()
     # Interval, AF, priority all stay unchanged
-    put(note, m); mw.col.update_note(note)
+    save_meta(card.nid, m)
     _set_review(card, m["iv"], 0)
     # If interleaving is active, re-hide the topic so it comes back via swap mechanism
     if _interleave_active:
@@ -1462,7 +1687,7 @@ def _cmd_advance_today():
     m["p"] = scheduler.clamp_priority(max(0, m["p"] - 10))
     m["af"] = scheduler.af_from_priority(m["p"])
     m["iv"] = 1
-    put(note, m); mw.col.update_note(note)
+    save_meta(card.nid, m)
     _set_review(card, 1, 0)
     # If interleaving is active, re-hide the topic so it comes back via swap mechanism
     if _interleave_active:
@@ -1476,7 +1701,7 @@ def _cmd_done():
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
     note = mw.col.get_note(card.nid); m = get(note); m["st"] = "done"
-    put(note, m); mw.col.update_note(note)
+    save_meta(card.nid, m)
     # Suspend all cards of this note (Anki suspend = permanently out of review)
     cids = [c.id for c in note.cards()]
     mw.col.sched.suspend_cards(cids)
@@ -1489,7 +1714,7 @@ def _cmd_forget():
     card = mw.reviewer.card
     if not card or not _is_topic_card(card): return
     note = mw.col.get_note(card.nid); m = get(note); m["st"] = "forgotten"; m["due"] = None
-    put(note, m); mw.col.update_note(note)
+    save_meta(card.nid, m)
     card.type = 2; card.queue = -2; card.due = _col_day() + 9999
     mw.col.update_card(card)
     # Remove from interleave queue
@@ -1561,8 +1786,7 @@ def _cmd_undo_text():
             m = get(note)
             m["p"] = old_p
             m["af"] = old_af
-            put(note, m)
-            mw.col.update_note(note)
+            save_meta(nid, m)
 
     # Delete the created note (cloze or extract) if tracked
     if nid in _created_history and _created_history[nid]:
@@ -1580,6 +1804,53 @@ def _cmd_undo_text():
     mw.reviewer._redraw_current_card()
     tooltip("Undone")
 
+
+def _cmd_undo_answer():
+    """Undo the last topic answer: restore IR metadata, card scheduling,
+    and re-insert the topic at the front of the interleave queue so it
+    appears as if the answer never happened."""
+    global _interleave_items_since, _interleave_swapping
+    if not _answer_history:
+        tooltip("No topic answer to undo."); return
+
+    snap = _answer_history.pop()
+    nid = snap["nid"]
+    cid = snap["cid"]
+
+    # 1. Restore IR metadata to pre-answer state
+    save_meta(nid, snap["meta"])
+
+    # 2. Restore Anki card scheduling to pre-answer state
+    try:
+        card = mw.col.get_card(cid)
+        card.ivl = snap["card_ivl"]
+        card.due = snap["card_due"]
+        card.type = snap["card_type"]
+        card.queue = snap["card_queue"]
+        mw.col.update_card(card)
+    except Exception:
+        tooltip("Undo failed: card not found."); return
+
+    # 3. Restore interleave queue state
+    #    Put the topic back at the front of the queue and mark it as unshown
+    _interleave_shown_topics.discard(cid)
+    if cid not in _interleave_topic_queue:
+        _interleave_topic_queue.insert(0, cid)
+    _interleave_items_since = snap.get("items_since", 0)
+
+    # 4. Navigate back to the restored topic
+    try:
+        mw.reviewer.card = card
+        mw.reviewer.card.start_timer()
+        if _ir_toolbar: _ir_toolbar.setVisible(True)
+        m = snap["meta"]
+        tooltip(f"Answer undone — P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f}")
+        _interleave_swapping = True
+        mw.reviewer._showQuestion()
+        _interleave_swapping = False
+    except Exception:
+        _interleave_swapping = False
+        tooltip("Answer undone (metadata restored)")
 
 
 # ============================================================
@@ -1930,7 +2201,7 @@ def _browser_set_priority(browser):
         old_p = m["p"]
         m["p"] = scheduler.clamp_priority(result)
         m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
-        put(note, m); mw.col.update_note(note)
+        save_meta(nid, m)
         _update_extract_priorities_proportionally(note, old_p, m["p"])
     tooltip(f"Priority set to {result:.1f}% on {len(topics)} topic(s).")
 
@@ -1944,7 +2215,7 @@ def _browser_advance_today(browser):
         m["p"] = scheduler.clamp_priority(max(0, m["p"] - 10))
         m["af"] = scheduler.af_from_priority(m["p"])
         m["iv"] = 1
-        put(note, m); mw.col.update_note(note)
+        save_meta(nid, m)
         # Also sync the card
         cards = note.cards()
         if cards: _set_review(cards[0], 1, 0)
@@ -1957,7 +2228,7 @@ def _browser_later_today(browser):
     for nid, note in topics:
         m = get(note)
         m["due"] = scheduler.today_str()
-        put(note, m); mw.col.update_note(note)
+        save_meta(nid, m)
         cards = note.cards()
         if cards: _set_review(cards[0], m["iv"], 0)
     tooltip(f"Scheduled {len(topics)} topic(s) for today.")
@@ -1977,7 +2248,7 @@ def _browser_reschedule(browser):
         m["af"] = scheduler.adjust_af_on_reschedule(m["iv"], m["af"], r["iv"])
         m["p"] = scheduler.adjust_priority_on_interval(m["p"], m["iv"], m["af"], r["iv"])
         m["due"], m["iv"] = r["due"], r["iv"]
-        put(note, m); mw.col.update_note(note)
+        save_meta(nid, m)
         cards = note.cards()
         if cards: _set_review(cards[0], m["iv"], days)
     tooltip(f"Rescheduled {len(topics)} topic(s) +{days}d.")
@@ -1990,7 +2261,7 @@ def _browser_postpone(browser):
         m = get(note)
         r = scheduler.postpone(m["iv"], m["af"])
         m["due"], m["iv"], m["af"] = r["due"], r["iv"], r["af"]
-        put(note, m); mw.col.update_note(note)
+        save_meta(nid, m)
         cards = note.cards()
         if cards: _set_review(cards[0], r["iv"], r["iv"])
     tooltip(f"Postponed {len(topics)} topic(s).")
@@ -2001,7 +2272,7 @@ def _browser_done(browser):
     if not topics: tooltip("No IR topics selected."); return
     for nid, note in topics:
         m = get(note); m["st"] = "done"
-        put(note, m); mw.col.update_note(note)
+        save_meta(nid, m)
         cids = [c.id for c in note.cards()]
         mw.col.sched.suspend_cards(cids)
     tooltip(f"Done (suspended) {len(topics)} topic(s).")
@@ -2012,7 +2283,7 @@ def _browser_forget(browser):
     if not topics: tooltip("No IR topics selected."); return
     for nid, note in topics:
         m = get(note); m["st"] = "forgotten"; m["due"] = None
-        put(note, m); mw.col.update_note(note)
+        save_meta(nid, m)
         cards = note.cards()
         if cards:
             c = cards[0]; c.type = 2; c.queue = -2

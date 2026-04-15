@@ -5,7 +5,7 @@ from datetime import date
 from typing import List, Tuple
 from aqt import mw
 from . import scheduler
-from .ir_meta import get, put, is_topic
+from .ir_meta import get, is_topic, save_meta
 
 
 def _iter_topic_notes(deck_name):
@@ -59,7 +59,7 @@ def auto_postpone(deck_name, protection_pct=10):
         m = get(note)
         r = scheduler.postpone(m["iv"], m["af"])
         m["due"], m["iv"], m["af"] = r["due"], r["iv"], r["af"]
-        put(note, m); mw.col.update_note(note); n += 1
+        save_meta(nid, m); n += 1
     return n
 
 
@@ -80,7 +80,7 @@ def mercy(deck_name, mercy_days=14):
         note = mw.col.get_note(nid)
         m = get(note)
         m["due"] = scheduler.date_from_days(i // per_day)
-        put(note, m); mw.col.update_note(note); n += 1
+        save_meta(nid, m); n += 1
     return n
 
 
@@ -95,5 +95,5 @@ def clean_orphans(deck_name):
         pnid = m.get("pnid", 0)
         if pnid and pnid not in all_nids:
             m["pnid"] = 0  # clear orphan parent ref
-            put(note, m); mw.col.update_note(note); n += 1
+            save_meta(nid, m); n += 1
     return n

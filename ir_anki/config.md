@@ -35,6 +35,8 @@
 - `key_done`: Done → `d`
 - `key_forget`: Forget/park → `f`
 - `key_edit_last`: Edit last created card → `Shift+e`
+- `key_undo_text`: Undo last extract/cloze highlight → `Alt+z`
+- `key_undo_answer`: Undo last topic answer (restore to queue) → `Ctrl+z`
 
 **Recommended Main deck settings:**
 - New cards/day: 9999 (let sub-decks control)
