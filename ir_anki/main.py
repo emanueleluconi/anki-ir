@@ -45,7 +45,7 @@ def cfg(key):
         "key_postpone": "Shift+w", "key_done": "Shift+d", "key_forget": "Shift+f",
         "key_later_today": "Shift+l", "key_advance_today": "Shift+a",
         "key_edit_last": "Shift+e", "key_undo_text": "Alt+z",
-        "key_undo_answer": "Ctrl+z",
+        "key_undo_answer": "Ctrl+Shift+z",
         "key_prepare": "Ctrl+Shift+p",
     }
     return c.get(key, defaults.get(key))

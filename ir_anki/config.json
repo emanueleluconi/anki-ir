@@ -28,10 +28,10 @@
     "key_advance_today": "Shift+a",
     "key_edit_last": "Shift+e",
     "key_undo_text": "Alt+z",
-    "key_undo_answer": "Ctrl+z",
+    "key_undo_answer": "Ctrl+Shift+z",
     "key_prepare": "Ctrl+Shift+p",
-    "zotero_library_id": "",
-    "zotero_api_key": "",
+    "zotero_library_id": "7676928",
+    "zotero_api_key": "eRnKGwH1h49IoAncMUA5HQsR",
     "zotero_import_tag": "imported",
     "zotero_highlight_color": "#ffd400"
 }
