@@ -43,12 +43,14 @@ def show_settings():
     layout = QVBoxLayout()
 
     widgets = {}
+    # Track which keys should be saved as float (QLineEdit used for float values)
+    float_keys = {"ir_alpha"}
 
     def add_group(title, fields):
         grp = QGroupBox(title)
         form = QFormLayout()
         for key, label, typ in fields:
-            if typ == "str":
+            if typ == "str" or typ == "float":
                 w = QLineEdit(str(conf[key]))
                 widgets[key] = w
                 form.addRow(label, w)
@@ -80,6 +82,7 @@ def show_settings():
         ("ir_first_review", "First review interval (days)", "int"),
         ("ir_max_interval", "Max interval ceiling (days)", "int"),
         ("ir_k", "Saturation speed k (higher = slower)", "int"),
+        ("ir_alpha", "Override sensitivity α (0.1–1.0)", "float"),
     ])
     add_group("Overload", [
         ("auto_postpone", "Auto-postpone on session start", "bool"),
@@ -148,7 +151,13 @@ def show_settings():
     def save():
         for k, w in widgets.items():
             if isinstance(w, QLineEdit):
-                conf[k] = w.text()
+                if k in float_keys:
+                    try:
+                        conf[k] = float(w.text())
+                    except ValueError:
+                        conf[k] = defaults.get(k, 0.5)
+                else:
+                    conf[k] = w.text()
             elif isinstance(w, QSpinBox):
                 conf[k] = w.value()
             elif isinstance(w, QCheckBox):
