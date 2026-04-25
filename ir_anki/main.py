@@ -1,7 +1,8 @@
 """
-Incremental Reading for Anki — SuperMemo 19 topic scheduling.
+Incremental Reading for Anki — saturating-curve topic scheduling.
 
-Topics = review cards (type=2, queue=2) with ivl/due controlled by SM19.
+Topics = review cards (type=2, queue=2) with ivl/due controlled by the
+         saturating curve scheduler (effective-N based).
 Items = normal Anki cards with FSRS (completely untouched).
 Studying parent deck interleaves both. Studying Items alone = pure FSRS.
 
@@ -37,6 +38,11 @@ def cfg(key):
         "initial_interval": 1, "default_priority": 50, "randomization_degree": 5,
         "auto_postpone": False, "postpone_protection": 30, "mercy_days": 14,
         "topic_item_ratio": 5,
+        # Saturating-curve scheduler parameters
+        "ir_first_review": 3,   # interval after first natural review (days)
+        "ir_max_interval": 21,  # asymptotic ceiling (days)
+        "ir_k": 4,              # saturation speed (halfway at review k+1)
+        "ir_alpha": 0.5,        # sensitivity of manual-override weighting
         "source_tag": "ir::source", "extract_tag": "ir::extract",
         "highlight_extract": "#5b9bd5", "highlight_cloze": "#c9a227",
         "key_extract": "x", "key_cloze": "z", "key_priority": "Shift+p",
@@ -51,11 +57,21 @@ def cfg(key):
     return c.get(key, defaults.get(key))
 
 
+def _sched_params():
+    """Return (first, maxiv, k, alpha) from config."""
+    return (
+        float(cfg("ir_first_review") or 3),
+        float(cfg("ir_max_interval") or 21),
+        float(cfg("ir_k") or 4),
+        float(cfg("ir_alpha") or 0.5),
+    )
+
+
 _last_created_nid: Optional[int] = None
 _ir_toolbar: Optional[QToolBar] = None
 _text_history: dict = {}  # nid → list of previous Text field values (for undo)
 _created_history: dict = {}  # nid → list of created note IDs (for undo — delete on undo)
-_priority_history: dict = {}  # nid → list of (priority, af) tuples (for undo — restore on undo)
+_priority_history: dict = {}  # nid → list of priority floats (for undo — restore on undo)
 
 # Undo-answer stack: each entry is a snapshot of the state before answering a topic
 # dict with keys: nid, cid, meta (IR-Data dict), card_ivl, card_due, card_type, card_queue,
@@ -118,7 +134,6 @@ def _update_extract_priorities_proportionally(source_note, old_p: float, new_p: 
             continue
         new_extract_p = scheduler.clamp_priority(m["p"] * ratio)
         m["p"] = new_extract_p
-        m["af"] = scheduler.af_from_priority_and_length(new_extract_p, m["tl"])
         save_meta(card.nid, m)
         updated += 1
     if updated:
@@ -362,15 +377,14 @@ def _prepare_topics():
         is_source_note = source_tag in note.tags
 
         if is_extract:
-            # Extract from Zotero: inherit priority from parent source
+            # Extract from Zotero: inherit priority from parent source (- 5 points)
             fnames = [f["name"] for f in note.note_type()["flds"]]
             parent_p = cfg("default_priority")
             if "Reference" in fnames:
                 ref = note["Reference"].strip()
                 if ref and ref in ref_to_priority:
                     parent_p = ref_to_priority[ref]
-            text_len = len(note.fields[0]) if note.fields else 0
-            init_extract(note, 0, parent_p, text_len)
+            init_extract(note, 0, parent_p)
             mw.col.update_note(note)
             _set_review(card, 1, 1)
             init_count += 1
@@ -415,11 +429,11 @@ def _prepare_topics():
                 ref = note["Reference"].strip()
                 if ref not in new_source_ref_to_priority: continue
                 correct_p = new_source_ref_to_priority[ref]
-                if abs(m["p"] - correct_p) < 0.01: continue  # already correct
-                # Only update IR-Data — save_meta does a fresh DB fetch internally
+                # Extract priority = parent - 5
+                correct_extract_p = scheduler.clamp_priority(correct_p - 5.0)
+                if abs(m["p"] - correct_extract_p) < 0.01: continue  # already correct
                 fm = get(mw.col.get_note(card.nid))
-                fm["p"] = correct_p
-                fm["af"] = scheduler.af_from_priority_and_length(correct_p, fm["tl"])
+                fm["p"] = correct_extract_p
                 save_meta(card.nid, fm)
 
     # Step 1b: Link orphan extracts to parent sources and deprioritize parents
@@ -461,22 +475,19 @@ def _prepare_topics():
         save_meta(note.id, m)
         new_extract_counts[parent_nid] = new_extract_counts.get(parent_nid, 0) + 1
 
-    # SM19: deprioritize parent sources for each new Zotero extract
-    for parent_nid, count in new_extract_counts.items():
-        try:
-            pn = mw.col.get_note(parent_nid)
-            pm = get(pn)
-            for _ in range(count):
-                pm["af"] = scheduler.parent_af_after_extract(pm["af"])
-                pm["p"] = scheduler.parent_priority_after_extract(pm["p"])
-            save_meta(parent_nid, pm)
-        except: pass
+    # Log how many extracts were newly linked (no parent deprioritization —
+    # priority is a stable user signal; the curve handles frequency naturally)
+    if new_extract_counts:
+        total_linked = sum(new_extract_counts.values())
+        tooltip(f"IR: linked {total_linked} extract(s) to parent source(s).")
 
     # Step 2: Auto-postpone (only once per day to avoid re-postponing on resume)
     postpone_count = 0
     global _postponed_today
     if cfg("auto_postpone") and not _postponed_today:
-        postpone_count = auto_postpone(deck, cfg("postpone_protection"))
+        first, maxiv, k, alpha = _sched_params()
+        postpone_count = auto_postpone(deck, cfg("postpone_protection"),
+                                       first=first, maxiv=maxiv, k=k, alpha=alpha)
         _postponed_today = True
 
     # Step 3: Clean orphans
@@ -617,22 +628,27 @@ def _custom_answer_card(self, ease, _old):
 
     today_iso = date.today().isoformat()
     is_due = not m["due"] or m["due"] <= today_iso
+    first, maxiv, k, alpha = _sched_params()
 
     if is_due:
-        r = scheduler.execute_repetition(m["iv"], m["af"], m["rc"])
-        m["rc"], m["lr"] = r["rc"], today_iso
-        m["due"], m["iv"], m["af"] = r["due"], r["iv"], r["af"]
+        r = scheduler.execute_repetition(m["en"], m["rc"],
+                                         first=first, maxiv=maxiv, k=k, alpha=alpha)
+        m["rc"]  = r["rc"]
+        m["lr"]  = today_iso
+        m["due"] = r["due"]
+        m["iv"]  = r["iv"]
+        m["en"]  = r["en"]
     else:
-        r = scheduler.mid_interval_rep(m["af"], m["rc"])
-        m["rc"], m["af"] = r["rc"], r["af"]
+        r = scheduler.mid_interval_rep(m["en"], m["rc"])
+        m["rc"] = r["rc"]
+        m["en"] = r["en"]
 
-    # save_meta does a fresh DB fetch internally, so it never overwrites
-    # Text-field highlights that _do_extract/_do_cloze may have saved.
     save_meta(card.nid, m)
 
     try:
         delta = max(1, (date.fromisoformat(m["due"]) - date.today()).days) if m["due"] else m["iv"]
-    except: delta = m["iv"]
+    except:
+        delta = m["iv"]
     _set_review(card, m["iv"], delta)
     self.nextCard()
 
@@ -640,7 +656,8 @@ def _custom_answer_card(self, ease, _old):
 def _custom_answer_buttons(self, _old):
     if self.card and _is_topic_card(self.card):
         m = get(self.card.note())
-        next_iv = scheduler.compute_next_interval(max(1, m["iv"]), m["af"])
+        first, maxiv, k, alpha = _sched_params()
+        next_iv = scheduler.next_interval(m["en"] + 1.0, first=first, maxiv=maxiv, k=k)
         return ((1, f"Next ({next_iv}d)"),)
     return _old(self)
 
@@ -694,7 +711,7 @@ def _on_show_question(card: Card):
     if _interleave_swapping:
         if _is_topic_card(card):
             m = get(card.note())
-            tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+            tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | EN:{m['en']:.2f} | Due:{m.get('due','?')}", period=2000)
         return
 
     # If interleaving hasn't been set up yet (first card shown before
@@ -719,7 +736,7 @@ def _on_show_question(card: Card):
                 if card.id not in _interleave_shown_topics:
                     _interleave_shown_topics.add(card.id)
                     m = get(card.note())
-                    tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+                    tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | EN:{m['en']:.2f} | Due:{m.get('due','?')}", period=2000)
                 return
 
             if card.id in _interleave_shown_topics or card.id != next_cid:
@@ -732,7 +749,7 @@ def _on_show_question(card: Card):
                     mw.reviewer.card.start_timer()
                     if _ir_toolbar: _ir_toolbar.setVisible(True)
                     m = get(topic_card.note())
-                    tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+                    tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | EN:{m['en']:.2f} | Due:{m.get('due','?')}", period=2000)
                     _interleave_swapping = True
                     mw.reviewer._showQuestion()
                     _interleave_swapping = False
@@ -743,11 +760,11 @@ def _on_show_question(card: Card):
             _interleave_topic_queue.pop(0)
             _interleave_shown_topics.add(card.id)
             m = get(card.note())
-            tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+            tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | EN:{m['en']:.2f} | Due:{m.get('due','?')}", period=2000)
             return
         if _is_topic_card(card):
             m = get(card.note())
-            tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+            tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | EN:{m['en']:.2f} | Due:{m.get('due','?')}", period=2000)
         return
 
     if _is_topic_card(card):
@@ -772,7 +789,7 @@ def _on_show_question(card: Card):
                     mw.reviewer.card.start_timer()
                     if _ir_toolbar: _ir_toolbar.setVisible(True)
                     m = get(topic_card.note())
-                    tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+                    tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | EN:{m['en']:.2f} | Due:{m.get('due','?')}", period=2000)
                     _interleave_swapping = True
                     mw.reviewer._showQuestion()
                     _interleave_swapping = False
@@ -792,7 +809,7 @@ def _on_show_question(card: Card):
                 mw.reviewer.card.start_timer()
                 if _ir_toolbar: _ir_toolbar.setVisible(True)
                 m = get(topic_card.note())
-                tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+                tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | EN:{m['en']:.2f} | Due:{m.get('due','?')}", period=2000)
                 _interleave_swapping = True
                 mw.reviewer._showQuestion()
                 _interleave_swapping = False
@@ -805,7 +822,7 @@ def _on_show_question(card: Card):
         if _interleave_topic_queue and _interleave_topic_queue[0] == card.id:
             _interleave_topic_queue.pop(0)
         m = get(card.note())
-        tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+        tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | EN:{m['en']:.2f} | Due:{m.get('due','?')}", period=2000)
         return
 
     # Anki gave us an item
@@ -837,7 +854,7 @@ def _on_show_question(card: Card):
             mw.reviewer.card.start_timer()
             if _ir_toolbar: _ir_toolbar.setVisible(True)
             m = get(topic_card.note())
-            tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f} | Due:{m.get('due','?')}", period=2000)
+            tooltip(f"P:{m['p']:.1f}% | I:{m['iv']}d | EN:{m['en']:.2f} | Due:{m.get('due','?')}", period=2000)
             _interleave_swapping = True
             mw.reviewer._showQuestion()
             _interleave_swapping = False
@@ -995,10 +1012,8 @@ def _do_extract(html):
 
     did = mw.col.decks.id_for_name(cfg("topics_deck")) or card.did
     pp = pm["p"] if pm else cfg("default_priority")
-    # Use plain text length for AF calculation (strip HTML tags)
-    import re as _re
-    plain_len = len(_re.sub(r'<[^>]+>', '', html))
-    init_extract(nn, parent.id, pp, plain_len)
+    # Extract priority = parent priority - 5 (so extracts appear before parent)
+    init_extract(nn, parent.id, pp)
     nn.note_type()["did"] = did
     mw.col.addNote(nn)
     _last_created_nid = nn.id
@@ -1006,15 +1021,11 @@ def _do_extract(html):
     new_cards = nn.cards()
     if new_cards: _set_review(new_cards[0], 1, 1)
 
-    # SM19: deprioritize parent after extraction
+    # Save parent priority for undo (no deprioritization — priority is stable)
     if pm:
-        # Save priority/AF for undo restoration
         nid = parent.id
         if nid not in _priority_history: _priority_history[nid] = []
-        _priority_history[nid].append((pm["p"], pm["af"]))
-        pm["af"] = scheduler.parent_af_after_extract(pm["af"])
-        pm["p"] = scheduler.parent_priority_after_extract(pm["p"])
-        save_meta(nid, pm)
+        _priority_history[nid].append(pm["p"])
 
     color = cfg("highlight_extract")
     # Highlight the selection visually in the webview (cosmetic only)
@@ -1595,13 +1606,12 @@ def _cmd_priority():
     if not card or not _is_topic_card_fresh(card): tooltip("Not a topic."); return
     note = mw.col.get_note(card.nid); m = get(note)
     old_p = m["p"]
-    result = ask_priority(m["p"], m["af"], m["iv"])
+    result = ask_priority(m["p"], m["iv"])
     if result is not None:
         m["p"] = scheduler.clamp_priority(result)
-        m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
         save_meta(card.nid, m)
         _update_extract_priorities_proportionally(note, old_p, m["p"])
-        tooltip(f"Priority: {m['p']:.1f}%, AF: {m['af']:.2f}")
+        tooltip(f"Priority: {m['p']:.1f}%")
 
 def _cmd_quick_priority(delta):
     card = mw.reviewer.card
@@ -1609,7 +1619,6 @@ def _cmd_quick_priority(delta):
     note = mw.col.get_note(card.nid); m = get(note)
     old_p = m["p"]
     m["p"] = scheduler.clamp_priority(m["p"] + delta)
-    m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
     save_meta(card.nid, m)
     _update_extract_priorities_proportionally(note, old_p, m["p"])
     tooltip(f"Priority: {m['p']:.1f}%")
@@ -1624,11 +1633,13 @@ def _cmd_reschedule():
     try: days = int(val)
     except ValueError: return
     if days < 1: return
-    r = scheduler.reschedule_increment(m["iv"], days)
-    m["af"] = scheduler.adjust_af_on_reschedule(m["iv"], m["af"], r["iv"])
-    m["p"] = scheduler.adjust_priority_on_interval(m["p"], m["iv"], m["af"], r["iv"])
-    m["due"], m["iv"] = r["due"], r["iv"]
-    # Note: lr (last review) NOT updated — this is the key SM Ctrl+J behavior
+    first, maxiv, k, alpha = _sched_params()
+    r = scheduler.reschedule_increment(m["en"], m["rc"], days,
+                                       first=first, maxiv=maxiv, k=k, alpha=alpha)
+    m["due"] = r["due"]
+    m["iv"]  = r["iv"]
+    m["en"]  = r["en"]
+    # Note: lr (last review) NOT updated — this is the SM Ctrl+J behaviour
     save_meta(card.nid, m)
     _set_review(card, m["iv"], days)
     try: _interleave_topic_queue.remove(card.id)
@@ -1645,23 +1656,31 @@ def _cmd_execute_rep():
     try: days = int(val)
     except ValueError: return
     if days < 1: return
-    m["af"] = scheduler.adjust_af_on_reschedule(m["iv"], m["af"], days)
-    m["p"] = scheduler.adjust_priority_on_interval(m["p"], m["iv"], m["af"], days)
-    m["due"] = scheduler.date_from_days(days); m["iv"] = days
-    m["lr"] = scheduler.today_str(); m["rc"] += 1
+    first, maxiv, k, alpha = _sched_params()
+    r = scheduler.execute_rep_manual(m["en"], m["rc"], days,
+                                     first=first, maxiv=maxiv, k=k, alpha=alpha)
+    m["due"] = r["due"]
+    m["iv"]  = r["iv"]
+    m["en"]  = r["en"]
+    m["rc"]  = r["rc"]
+    m["lr"]  = scheduler.today_str()
     save_meta(card.nid, m)
     _set_review(card, days, days)
     try: _interleave_topic_queue.remove(card.id)
     except ValueError: pass
-    tooltip(f"Execute rep: interval={days}d, AF={m['af']:.2f}"); mw.reviewer.nextCard()
+    tooltip(f"Execute rep: interval={days}d, EN={m['en']:.2f}"); mw.reviewer.nextCard()
 
 def _cmd_postpone():
     """SM Postpone: multiply interval by 1.5x."""
     card = mw.reviewer.card
     if not card or not _is_topic_card_fresh(card): return
     note = mw.col.get_note(card.nid); m = get(note)
-    r = scheduler.postpone(m["iv"], m["af"])
-    m["due"], m["iv"], m["af"] = r["due"], r["iv"], r["af"]
+    first, maxiv, k, alpha = _sched_params()
+    r = scheduler.postpone(m["en"], m["rc"], m["iv"],
+                           first=first, maxiv=maxiv, k=k, alpha=alpha)
+    m["due"] = r["due"]
+    m["iv"]  = r["iv"]
+    m["en"]  = r["en"]
     save_meta(card.nid, m)
     _set_review(card, r["iv"], r["iv"])
     try: _interleave_topic_queue.remove(card.id)
@@ -1693,7 +1712,6 @@ def _cmd_advance_today():
     note = mw.col.get_note(card.nid); m = get(note)
     m["due"] = scheduler.today_str()
     m["p"] = scheduler.clamp_priority(max(0, m["p"] - 10))
-    m["af"] = scheduler.af_from_priority(m["p"])
     m["iv"] = 1
     save_meta(card.nid, m)
     _set_review(card, 1, 0)
@@ -1798,13 +1816,12 @@ def _cmd_undo_text():
     note["Text"] = prev
     mw.col.update_note(note)
 
-    # Restore priority/AF if saved
+    # Restore priority if saved
     if nid in _priority_history and _priority_history[nid]:
-        old_p, old_af = _priority_history[nid].pop()
+        old_p = _priority_history[nid].pop()
         if is_topic(note):
             m = get(note)
             m["p"] = old_p
-            m["af"] = old_af
             save_meta(nid, m)
 
     # Delete the created note (cloze or extract) if tracked
@@ -1863,7 +1880,7 @@ def _cmd_undo_answer():
         mw.reviewer.card.start_timer()
         if _ir_toolbar: _ir_toolbar.setVisible(True)
         m = snap["meta"]
-        tooltip(f"Answer undone — P:{m['p']:.1f}% | I:{m['iv']}d | AF:{m['af']:.2f}")
+        tooltip(f"Answer undone — P:{m['p']:.1f}% | I:{m['iv']}d | EN:{m['en']:.2f}")
         _interleave_swapping = True
         mw.reviewer._showQuestion()
         _interleave_swapping = False
@@ -2020,17 +2037,17 @@ def _show_stats():
 
     today = date.today().isoformat()
     total = due = active = done = forgotten = 0
-    avg_af = 0.0; avg_iv = 0.0; avg_p = 0.0
+    avg_en = 0.0; avg_iv = 0.0; avg_p = 0.0
     for _, _, m in _iter_topic_notes(cfg("topics_deck")):
         total += 1
         if m["st"] == "active":
             active += 1
-            avg_af += m["af"]; avg_iv += m["iv"]; avg_p += m["p"]
+            avg_en += m["en"]; avg_iv += m["iv"]; avg_p += m["p"]
             if m.get("due") and m["due"] <= today: due += 1
         elif m["st"] == "done": done += 1
         elif m["st"] == "forgotten": forgotten += 1
     if active > 0:
-        avg_af /= active; avg_iv /= active; avg_p /= active
+        avg_en /= active; avg_iv /= active; avg_p /= active
 
     queue = build_queue(cfg("topics_deck"), cfg("randomization_degree"))
 
@@ -2059,7 +2076,7 @@ def _show_stats():
     stats = (
         f"Total: {total}  |  Active: {active}  |  Due today: {due}  |  "
         f"Done: {done}  |  Forgotten: {forgotten}\n"
-        f"Avg priority: {avg_p:.1f}%  |  Avg AF: {avg_af:.2f}  |  Avg interval: {avg_iv:.0f}d\n"
+        f"Avg priority: {avg_p:.1f}%  |  Avg EN: {avg_en:.2f}  |  Avg interval: {avg_iv:.0f}d\n"
         f"Queue: {len(queue)} topics + {items_due_count} items due"
     )
     lbl = QLabel(stats); lbl.setWordWrap(True)
@@ -2077,7 +2094,7 @@ def _show_stats():
             import re
             title = re.sub(r'<[^>]+>', '', title).strip()[:70]
             item = QListWidgetItem(
-                f"{pos+1}. [{m['p']:.0f}%] {title}  (I:{m['iv']}d AF:{m['af']:.2f})"
+                f"{pos+1}. [{m['p']:.0f}%] {title}  (I:{m['iv']}d EN:{m['en']:.2f})"
             )
             lst.addItem(item)
         except:
@@ -2213,13 +2230,12 @@ def _browser_set_priority(browser):
     if not topics: tooltip("No IR topics selected."); return
     # Use first selected topic's current priority as default
     m0 = get(topics[0][1])
-    result = ask_priority(m0["p"], m0["af"], m0["iv"])
+    result = ask_priority(m0["p"], m0["iv"])
     if result is None: return
     for nid, note in topics:
         m = get(note)
         old_p = m["p"]
         m["p"] = scheduler.clamp_priority(result)
-        m["af"] = scheduler.af_from_priority_and_length(m["p"], m["tl"])
         save_meta(nid, m)
         _update_extract_priorities_proportionally(note, old_p, m["p"])
     tooltip(f"Priority set to {result:.1f}% on {len(topics)} topic(s).")
@@ -2232,7 +2248,6 @@ def _browser_advance_today(browser):
         m = get(note)
         m["due"] = scheduler.today_str()
         m["p"] = scheduler.clamp_priority(max(0, m["p"] - 10))
-        m["af"] = scheduler.af_from_priority(m["p"])
         m["iv"] = 1
         save_meta(nid, m)
         # Also sync the card
@@ -2261,12 +2276,14 @@ def _browser_reschedule(browser):
     try: days = int(val)
     except ValueError: return
     if days < 1: return
+    first, maxiv, k, alpha = _sched_params()
     for nid, note in topics:
         m = get(note)
-        r = scheduler.reschedule_increment(m["iv"], days)
-        m["af"] = scheduler.adjust_af_on_reschedule(m["iv"], m["af"], r["iv"])
-        m["p"] = scheduler.adjust_priority_on_interval(m["p"], m["iv"], m["af"], r["iv"])
-        m["due"], m["iv"] = r["due"], r["iv"]
+        r = scheduler.reschedule_increment(m["en"], m["rc"], days,
+                                           first=first, maxiv=maxiv, k=k, alpha=alpha)
+        m["due"] = r["due"]
+        m["iv"]  = r["iv"]
+        m["en"]  = r["en"]
         save_meta(nid, m)
         cards = note.cards()
         if cards: _set_review(cards[0], m["iv"], days)
@@ -2276,10 +2293,14 @@ def _browser_reschedule(browser):
 def _browser_postpone(browser):
     topics = _browser_get_topic_notes(browser)
     if not topics: tooltip("No IR topics selected."); return
+    first, maxiv, k, alpha = _sched_params()
     for nid, note in topics:
         m = get(note)
-        r = scheduler.postpone(m["iv"], m["af"])
-        m["due"], m["iv"], m["af"] = r["due"], r["iv"], r["af"]
+        r = scheduler.postpone(m["en"], m["rc"], m["iv"],
+                               first=first, maxiv=maxiv, k=k, alpha=alpha)
+        m["due"] = r["due"]
+        m["iv"]  = r["iv"]
+        m["en"]  = r["en"]
         save_meta(nid, m)
         cards = note.cards()
         if cards: _set_review(cards[0], r["iv"], r["iv"])

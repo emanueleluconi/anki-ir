@@ -5,14 +5,14 @@ from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
                      QSlider, QPushButton, Qt)
 
 
-def ask_priority(current: float, af: float, interval: int) -> float | None:
+def ask_priority(current: float, interval: int) -> float | None:
     """Show priority dialog. Returns new priority or None if cancelled."""
     dlg = QDialog(mw)
     dlg.setWindowTitle("Set Priority")
     dlg.setMinimumWidth(350)
     layout = QVBoxLayout()
 
-    info = QLabel(f"Current: {current:.1f}%  |  AF: {af:.2f}  |  Interval: {interval}d")
+    info = QLabel(f"Current: {current:.1f}%  |  Interval: {interval}d")
     layout.addWidget(info)
 
     # Slider
