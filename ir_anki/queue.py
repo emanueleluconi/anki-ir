@@ -29,6 +29,7 @@ def build_queue(deck_name, randomization=0):
     """Return list of nids sorted by priority (ascending = most important first).
 
     randomization: 0-100 integer; higher values introduce more random swaps.
+    Priority ties are broken by nid for deterministic ordering.
     """
     today = date.today().isoformat()
     cands = []
@@ -40,8 +41,6 @@ def build_queue(deck_name, randomization=0):
             continue
         cands.append((m["p"], nid))
 
-    # Primary sort: priority ascending (0 = most important)
-    # Secondary sort: nid for deterministic tie-breaking
     cands.sort(key=lambda x: (x[0], x[1]))
 
     if randomization > 0 and len(cands) > 1:
@@ -55,11 +54,7 @@ def build_queue(deck_name, randomization=0):
     return [c[1] for c in cands]
 
 
-def auto_postpone(deck_name, protection_pct=10,
-                  first=scheduler.DEFAULT_FIRST_REVIEW,
-                  maxiv=scheduler.DEFAULT_MAX_INTERVAL,
-                  k=scheduler.DEFAULT_K,
-                  alpha=scheduler.DEFAULT_ALPHA):
+def auto_postpone(deck_name, protection_pct=10):
     """Postpone overdue low-priority topics, protecting the top protection_pct%.
 
     Only topics from *previous* days are affected (SM19 behaviour).
@@ -86,11 +81,10 @@ def auto_postpone(deck_name, protection_pct=10,
     for _, nid in overdue[prot:]:
         note = mw.col.get_note(nid)
         m = get(note)
-        r = scheduler.postpone(m["en"], m["rc"], m["iv"],
-                               first=first, maxiv=maxiv, k=k, alpha=alpha)
-        m["due"] = r["due"]
+        r = scheduler.postpone(m["iv"], m["af"], cap=m.get("cap", 0))
         m["iv"]  = r["iv"]
-        m["en"]  = r["en"]
+        m["af"]  = r["af"]
+        m["due"] = r["due"]
         save_meta(nid, m)
         n += 1
     return n
@@ -99,7 +93,8 @@ def auto_postpone(deck_name, protection_pct=10,
 def mercy(deck_name, mercy_days=14):
     """Spread all overdue/due topics evenly across mercy_days days.
 
-    Returns the number of topics rescheduled.
+    Returns the number of topics rescheduled. Does NOT touch AF/lr/rc
+    because mercy is a bulk reschedule, not a bulk review.
     """
     if not mw.col:
         return 0
@@ -116,7 +111,7 @@ def mercy(deck_name, mercy_days=14):
     if not overdue or mercy_days <= 0:
         return 0
 
-    overdue.sort(key=lambda x: x[0])  # best priority first
+    overdue.sort(key=lambda x: x[0])
     per_day = max(1, math.ceil(len(overdue) / mercy_days))
     n = 0
     for i, (_, nid) in enumerate(overdue):
@@ -129,10 +124,7 @@ def mercy(deck_name, mercy_days=14):
 
 
 def clean_orphans(deck_name):
-    """Clear pnid on extracts whose parent note no longer exists.
-
-    Returns the number of orphans cleaned.
-    """
+    """Clear pnid on extracts whose parent note no longer exists."""
     if not mw.col:
         return 0
     all_nids = set()

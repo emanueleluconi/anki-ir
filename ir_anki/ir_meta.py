@@ -1,17 +1,15 @@
 """IR metadata stored as compact JSON in 'IR-Data' field on topic notes.
 
 Schema (all keys always present):
-    p    float  priority 0-100 (0 = most important)
-    iv   int    last set interval in days
-    en   float  effective-N for the saturating curve (accumulates on each review)
+    p    float  priority 0-100 (0 = most important), 2-decimal precision
+    iv   int    current interval in days
+    af   float  A-Factor (1.2-6.9): next_interval = ceil(iv × af)
+    cap  int    per-topic interval ceiling (0 = no cap)
     due  str    ISO date of next review, or null
     lr   str    ISO date of last review, or null
     rc   int    total review count
     st   str    "active" | "done" | "dismissed" | "forgotten"
     pnid int    parent note ID (0 = no parent / orphan)
-
-AF and tl (text length) have been removed.  The saturating curve uses en
-instead of AF, and interval growth is no longer length-dependent.
 """
 
 import json
@@ -21,7 +19,8 @@ IR_FIELD = "IR-Data"
 DEFAULT = {
     "p":    50.0,
     "iv":   1,
-    "en":   0.0,
+    "af":   2.0,
+    "cap":  0,
     "due":  None,
     "lr":   None,
     "rc":   0,
@@ -29,9 +28,8 @@ DEFAULT = {
     "pnid": 0,
 }
 
-# Keys that existed in the old schema but are no longer used.
-# We silently drop them when reading old notes so they don't linger.
-_OBSOLETE_KEYS = {"af", "tl"}
+# Keys from older schema versions that we silently drop on read.
+_OBSOLETE_KEYS = {"en", "tl"}
 
 
 def get(note) -> dict:
@@ -53,7 +51,6 @@ def get(note) -> dict:
 
 
 def put(note, m: dict):
-    # Never write obsolete keys
     clean = {k: v for k, v in m.items() if k not in _OBSOLETE_KEYS}
     try:
         note[IR_FIELD] = json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
@@ -62,12 +59,7 @@ def put(note, m: dict):
 
 
 def save_meta(nid: int, m: dict):
-    """Safely persist IR metadata without touching any other field.
-
-    Always fetches a fresh note from the DB, writes ONLY the IR-Data field,
-    and saves.  This prevents stale Python objects from overwriting content
-    fields (e.g. highlights in Text) that were modified by another code path.
-    """
+    """Safely persist IR metadata without touching any other field."""
     from aqt import mw
     note = mw.col.get_note(nid)
     put(note, m)
@@ -92,27 +84,30 @@ def is_topic(note) -> bool:
 
 # ── Initialisation helpers ────────────────────────────────────────────────────
 
-def init_source(note, priority: float = 50.0):
-    """Initialise a brand-new source note with the given priority."""
+def init_source(note, priority: float = 50.0, cap: int = 0):
+    """Initialise a brand-new source note with the given priority and cap."""
+    p = scheduler.clamp_priority(priority)
     m = dict(DEFAULT)
-    m["p"]   = scheduler.clamp_priority(priority)
+    m["p"]   = p
     m["iv"]  = 1
-    m["en"]  = 0.0
+    m["af"]  = scheduler.af_from_priority(p)
+    m["cap"] = int(cap) if cap else 0
     m["due"] = scheduler.date_from_days(1)
     put(note, m)
 
 
-def init_extract(note, parent_nid: int, parent_priority: float):
+def init_extract(note, parent_nid: int, parent_priority: float, cap: int = 0):
     """Initialise a new extract note.
 
-    Priority = parent_priority - 5 (clamped to [0, 100]) so extracts
-    appear before their parent in the priority queue.
-    Both Zotero-imported and manually created extracts use this function.
+    Priority = parent - 5 so extracts appear before their parent.
+    AF derived from the extract's own (lower) priority.
     """
+    p = scheduler.clamp_priority(parent_priority - 5.0)
     m = dict(DEFAULT)
-    m["p"]    = scheduler.clamp_priority(parent_priority - 5.0)
+    m["p"]    = p
     m["iv"]   = 1
-    m["en"]   = 0.0
+    m["af"]   = scheduler.af_from_priority(p)
+    m["cap"]  = int(cap) if cap else 0
     m["due"]  = scheduler.date_from_days(1)
     m["pnid"] = parent_nid
     put(note, m)

@@ -1,36 +1,39 @@
-"""Saturating-curve topic scheduler with effective-N tracking.
+"""Topic scheduler: AF × iv with optional per-topic interval ceiling.
 
-Interval formula (from incremental-everything, adapted):
-    interval = ⌈firstReview + (maxInterval - firstReview) × en / (en + k)⌉
+Faithful to SuperMemo's topic scheduling:
+    next_interval = min(cap, max(1, ceil(iv × af)))
 
-Where `en` (effective N) is a float that accumulates on each review:
-    weight = clamp(actual / expected, 0.1, 10) ** alpha
-    en += weight
+Key distinctions:
+- execute_repetition / execute_rep_manual: "I reviewed this card" — updates
+  lr, rc, and adjusts AF based on actual vs expected interval.
+- reschedule_absolute / reschedule_increment: "Just move the card" — does
+  NOT touch lr, rc, or AF. The scheduling state is preserved so next time
+  you actually review, AF/interval math proceeds as if no reschedule
+  happened.
 
-- actual < expected  → weight < 1  → en grows slowly  → curve stays low
-  (you kept setting short intervals → topic stays in short-interval territory)
-- actual ≈ expected  → weight ≈ 1  → en grows normally → curve saturates as designed
-- actual > expected  → weight > 1  → en grows faster   → curve saturates sooner
-  (you postponed → topic moves toward maxInterval faster)
+AF is initialized from priority via a concave curve that keeps low-priority
+(high-importance) topics in tight rotation:
+    af = 1.2 + (p/100)^1.5 × 2.3
 
-Manual execute_rep with interval=X:
-    expected = current curve value for current en
-    weight   = (X / expected) ** alpha
-    en      += weight
-    interval = X  (as set by user)
+  p=0   → af=1.20  (slow: 1→2→3→4→5)
+  p=25  → af=1.49  (slow-medium)
+  p=50  → af=2.01  (medium)
+  p=75  → af=2.70  (faster)
+  p=100 → af=3.50  (fast)
 
-This means repeated 1d overrides keep en low, so the next natural review
-also gives a short interval — the curve "remembers" your reading frequency.
+On manual override, AF is nudged in the direction of the override:
+    ratio  = actual / expected
+    af_new = clamp(af × ratio^0.5, AF_MIN, AF_MAX)
+
+This preserves some memory of past AF (square root dampens the adjustment)
+while making the override meaningfully steer future growth.
 """
 
 import math
 from datetime import date, timedelta
 
-# ── Defaults (overridden by config in main.py) ──────────────────────────────
-DEFAULT_FIRST_REVIEW = 3    # days after first review
-DEFAULT_MAX_INTERVAL = 21   # asymptotic ceiling (days)
-DEFAULT_K            = 4    # saturation speed (halfway at review k+1)
-DEFAULT_ALPHA        = 0.5  # sensitivity of manual-override weighting
+AF_MIN = 1.2   # most-important / most-difficult topic: slowest growth
+AF_MAX = 6.9   # least-important / easiest topic: fastest growth
 
 
 def today_str() -> str:
@@ -42,113 +45,145 @@ def date_from_days(d: int) -> str:
 
 
 def clamp_priority(p: float) -> float:
+    """Clamp priority to [0, 100] with 2 decimal precision (10,000 unique slots)."""
     return round(max(0.0, min(100.0, p)) * 100) / 100
 
 
-# ── Core curve ───────────────────────────────────────────────────────────────
-
-def _curve(en: float, first: float, maxiv: float, k: float) -> int:
-    """Compute next interval from effective-N and curve parameters."""
-    if en <= 0:
-        return max(1, int(math.ceil(first)))
-    return max(1, int(math.ceil(first + (maxiv - first) * en / (en + k))))
+def _clamp_af(af: float) -> float:
+    return min(AF_MAX, max(AF_MIN, af))
 
 
-def next_interval(en: float, first: float = DEFAULT_FIRST_REVIEW,
-                  maxiv: float = DEFAULT_MAX_INTERVAL,
-                  k: float = DEFAULT_K) -> int:
-    """Public: next interval in days given current effective-N."""
-    return _curve(en, first, maxiv, k)
+# ── AF ↔ priority mapping ────────────────────────────────────────────────────
+
+def af_from_priority(p: float) -> float:
+    """Initial AF from priority. Concave curve — low-p topics stay in tight rotation.
+
+    p=0 (most important) → AF=1.2  (intervals barely grow: 1→2→3→4)
+    p=100 (least important) → AF=3.5 (intervals grow fast: 1→4→14→49)
+    """
+    p = max(0.0, min(100.0, p))
+    af = 1.2 + ((p / 100.0) ** 1.5) * 2.3
+    return _clamp_af(af)
 
 
-def _weight(actual: int, expected: int, alpha: float = DEFAULT_ALPHA) -> float:
-    """Weight to add to en based on actual vs expected interval."""
-    ratio = max(0.1, min(10.0, actual / max(1, expected)))
-    return ratio ** alpha
+# ── Interval computation ─────────────────────────────────────────────────────
+
+def next_interval(iv: int, af: float, cap: int = 0) -> int:
+    """Compute next interval from current iv and af, optionally capped.
+
+    cap = 0 (or None) means no cap. Otherwise result is clamped to cap.
+    """
+    ni = max(1, int(math.ceil(max(1, iv) * af)))
+    if cap and cap > 0:
+        ni = min(cap, ni)
+    return ni
+
+
+def apply_cap(iv: int, cap: int) -> int:
+    """Clamp an interval to the cap (0/None = no cap)."""
+    if cap and cap > 0:
+        return min(cap, max(1, iv))
+    return max(1, iv)
+
+
+# ── AF adjustment on manual override ─────────────────────────────────────────
+
+def _adjust_af(iv: int, af: float, new_iv: int) -> float:
+    """Nudge AF toward the ratio implied by the user's chosen new interval.
+
+    Uses sqrt dampening so AF doesn't swing too hard on a single override.
+    """
+    expected = max(1, int(math.ceil(max(1, iv) * af)))
+    if expected <= 0:
+        return af
+    ratio = new_iv / expected
+    ratio = max(0.1, min(10.0, ratio))
+    return _clamp_af(af * (ratio ** 0.5))
 
 
 # ── Review actions ────────────────────────────────────────────────────────────
 
-def execute_repetition(en: float, rc: int,
-                       first: float = DEFAULT_FIRST_REVIEW,
-                       maxiv: float = DEFAULT_MAX_INTERVAL,
-                       k: float = DEFAULT_K,
-                       alpha: float = DEFAULT_ALPHA) -> dict:
-    """Normal queue review: advance en by weight=1 (on-schedule review)."""
-    # On a natural review we assume actual ≈ expected, so weight = 1.0
-    new_en = en + 1.0
-    ni = _curve(new_en, first, maxiv, k)
+def execute_repetition(iv: int, af: float, rc: int, cap: int = 0) -> dict:
+    """Natural queue review ("Next" button pressed on due card).
+
+    Computes the next interval from AF, caps it, advances rc and lr.
+    AF itself is NOT changed — the user just accepted the plugin's suggestion.
+    """
+    ni = next_interval(iv, af, cap)
     return {
-        "due": date_from_days(ni),
         "iv":  ni,
-        "en":  new_en,
+        "af":  af,
         "rc":  rc + 1,
+        "lr":  today_str(),
+        "due": date_from_days(ni),
     }
 
 
-def execute_rep_manual(en: float, rc: int, new_days: int,
-                       first: float = DEFAULT_FIRST_REVIEW,
-                       maxiv: float = DEFAULT_MAX_INTERVAL,
-                       k: float = DEFAULT_K,
-                       alpha: float = DEFAULT_ALPHA) -> dict:
-    """Manual execute_rep (Shift+R): user sets explicit interval.
+def execute_rep_manual(iv: int, af: float, rc: int, new_days: int,
+                       cap: int = 0) -> dict:
+    """Manual execute-rep: user reviewed and chose an explicit interval.
 
-    Weight reflects how the chosen interval compares to what the curve
-    would have given — short overrides keep en low, long ones push it up.
+    Updates lr, rc, AND adjusts AF to reflect the user's choice.
+    Caps the stored iv so the cap is honored on the very next cycle.
     """
-    expected = _curve(en, first, maxiv, k)
-    w = _weight(new_days, expected, alpha)
-    new_en = en + w
+    capped = apply_cap(new_days, cap)
+    new_af = _adjust_af(iv, af, capped)
     return {
-        "due": date_from_days(new_days),
-        "iv":  new_days,
-        "en":  new_en,
+        "iv":  capped,
+        "af":  new_af,
         "rc":  rc + 1,
+        "lr":  today_str(),
+        "due": date_from_days(capped),
     }
 
 
-def reschedule_increment(en: float, rc: int, added_days: int,
-                         first: float = DEFAULT_FIRST_REVIEW,
-                         maxiv: float = DEFAULT_MAX_INTERVAL,
-                         k: float = DEFAULT_K,
-                         alpha: float = DEFAULT_ALPHA) -> dict:
-    """Reschedule (+days, Shift+J): add days to current interval.
+def reschedule_absolute(iv: int, af: float, rc: int, new_days: int,
+                        cap: int = 0) -> dict:
+    """Reschedule: set due=today+new_days. Nothing else changes.
 
-    lr (last review) is NOT updated — this is the SM Ctrl+J behaviour.
-    en is adjusted by weight of the new total interval vs expected.
+    lr, rc, af are NOT touched. Use when you haven't actually reviewed the
+    card but want to change when it next appears (SM Ctrl+J semantics).
     """
-    expected = _curve(en, first, maxiv, k)
-    new_iv = max(1, expected + added_days)
-    w = _weight(new_iv, expected, alpha)
-    new_en = en + w
+    capped = apply_cap(new_days, cap)
     return {
-        "due": date_from_days(new_iv),
-        "iv":  new_iv,
-        "en":  new_en,
+        "iv":  capped,
+        "af":  af,      # unchanged
+        "rc":  rc,      # unchanged
+        # lr NOT returned — caller keeps existing value
+        "due": date_from_days(capped),
     }
 
 
-def mid_interval_rep(en: float, rc: int) -> dict:
-    """Mid-interval review (card shown before due date): en unchanged."""
-    return {"rc": rc + 1, "en": en}
+def reschedule_increment(iv: int, af: float, rc: int, added_days: int,
+                         cap: int = 0) -> dict:
+    """Reschedule by adding days to current interval. No AF/lr/rc change.
 
-
-def postpone(en: float, rc: int, iv: int,
-             factor: float = 1.5,
-             first: float = DEFAULT_FIRST_REVIEW,
-             maxiv: float = DEFAULT_MAX_INTERVAL,
-             k: float = DEFAULT_K,
-             alpha: float = DEFAULT_ALPHA) -> dict:
-    """Postpone (Shift+W): multiply current interval by factor.
-
-    en is adjusted upward because we're reviewing later than expected.
+    Useful for "push this a bit further" without signalling a review.
     """
-    expected = _curve(en, first, maxiv, k)
-    new_iv = max(1, int(math.ceil(max(1, iv) * factor)))
-    w = _weight(new_iv, expected, alpha)
-    new_en = en + w
+    new_iv = apply_cap(max(1, iv) + max(1, added_days), cap)
     return {
-        "due": date_from_days(new_iv),
         "iv":  new_iv,
-        "en":  new_en,
+        "af":  af,      # unchanged
+        "rc":  rc,      # unchanged
+        "due": date_from_days(new_iv),
+    }
+
+
+def mid_interval_rep(af: float, rc: int) -> dict:
+    """Card shown before its due date: count the review, leave AF alone."""
+    return {"rc": rc + 1, "af": af}
+
+
+def postpone(iv: int, af: float, cap: int = 0, factor: float = 1.5) -> dict:
+    """Postpone: multiply current interval by factor (default 1.5×).
+
+    Pushes AF up slightly because the user signalled they want less
+    frequent reviews, but dampened.
+    """
+    new_iv = apply_cap(max(1, int(math.ceil(max(1, iv) * factor))), cap)
+    new_af = _adjust_af(iv, af, new_iv)
+    return {
+        "iv":  new_iv,
+        "af":  new_af,
+        "due": date_from_days(new_iv),
     }

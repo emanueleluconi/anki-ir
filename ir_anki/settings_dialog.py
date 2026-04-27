@@ -14,7 +14,7 @@ def show_settings():
         "initial_interval": 1, "default_priority": 50, "randomization_degree": 5,
         "auto_postpone": True, "postpone_protection": 10, "mercy_days": 14,
         "topic_item_ratio": 5,
-        "ir_first_review": 3, "ir_max_interval": 21, "ir_k": 4, "ir_alpha": 0.5,
+        "source_cap_default": 14, "extract_cap_default": 0,
         "source_tag": "ir::source", "extract_tag": "ir::extract",
         "highlight_extract": "#5b9bd5", "highlight_cloze": "#c9a227",
         "key_extract": "x", "key_cloze": "z", "key_priority": "Shift+p",
@@ -43,14 +43,12 @@ def show_settings():
     layout = QVBoxLayout()
 
     widgets = {}
-    # Track which keys should be saved as float (QLineEdit used for float values)
-    float_keys = {"ir_alpha"}
 
     def add_group(title, fields):
         grp = QGroupBox(title)
         form = QFormLayout()
         for key, label, typ in fields:
-            if typ == "str" or typ == "float":
+            if typ == "str":
                 w = QLineEdit(str(conf[key]))
                 widgets[key] = w
                 form.addRow(label, w)
@@ -79,10 +77,8 @@ def show_settings():
         ("default_priority", "Default priority (0-100)", "int"),
         ("randomization_degree", "Randomization (0-100)", "int"),
         ("topic_item_ratio", "Items per topic (interleave ratio)", "int"),
-        ("ir_first_review", "First review interval (days)", "int"),
-        ("ir_max_interval", "Max interval ceiling (days)", "int"),
-        ("ir_k", "Saturation speed k (higher = slower)", "int"),
-        ("ir_alpha", "Override sensitivity α (0.1–1.0)", "float"),
+        ("source_cap_default", "Source default interval cap (days, 0=none)", "int"),
+        ("extract_cap_default", "Extract default interval cap (days, 0=none)", "int"),
     ])
     add_group("Overload", [
         ("auto_postpone", "Auto-postpone on session start", "bool"),
@@ -151,13 +147,7 @@ def show_settings():
     def save():
         for k, w in widgets.items():
             if isinstance(w, QLineEdit):
-                if k in float_keys:
-                    try:
-                        conf[k] = float(w.text())
-                    except ValueError:
-                        conf[k] = defaults.get(k, 0.5)
-                else:
-                    conf[k] = w.text()
+                conf[k] = w.text()
             elif isinstance(w, QSpinBox):
                 conf[k] = w.value()
             elif isinstance(w, QCheckBox):
