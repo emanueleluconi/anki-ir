@@ -1219,6 +1219,43 @@ def _replace_at_context(text, needle, replacement, before, after):
     return text[:best_idx] + replacement + text[best_idx + len(needle):]
 
 
+def _replace_at_offset(text, needle, replacement, plain_offset):
+    """Replace the occurrence of needle in text whose plain-text position is
+    closest to plain_offset (the JS-computed character offset of the selection
+    in the rendered card).
+
+    This is more reliable than context-based matching because it uses the
+    exact position the user selected, not surrounding text that may repeat.
+
+    Returns the modified text, or None if needle is not found.
+    """
+    import re as _re
+    positions = []
+    start = 0
+    while True:
+        idx = text.find(needle, start)
+        if idx == -1:
+            break
+        positions.append(idx)
+        start = idx + 1
+    if not positions:
+        return None
+    if len(positions) == 1:
+        return text[:positions[0]] + replacement + text[positions[0] + len(needle):]
+
+    # Map each HTML position to its plain-text offset and pick the closest
+    best_idx = positions[0]
+    best_dist = float('inf')
+    for pos in positions:
+        # Count plain-text characters before this HTML position
+        pt_offset = len(_re.sub(r'<[^>]+>', '', text[:pos]))
+        dist = abs(pt_offset - plain_offset)
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = pos
+    return text[:best_idx] + replacement + text[best_idx + len(needle):]
+
+
 def _cmd_cloze():
     if mw.state != "review": return
     # Get selection text, HTML, context, AND character offset within the card content.
@@ -1523,9 +1560,13 @@ def _do_cloze(result):
     cloze_marker = "{{c1::" + keyword + "}}"
     
     # Build cloze text: the FULL parent text with the keyword wrapped in cloze
-    # This ensures all surrounding context is preserved in the cloze card
+    # This ensures all surrounding context is preserved in the cloze card.
+    # Prefer offset-based replacement (exact position from JS selection),
+    # fall back to context-based, then to first-occurrence.
     if keyword in parent_text:
-        cloze_text = _replace_at_context(parent_text, keyword, cloze_marker, before_ctx, after_ctx)
+        cloze_text = _replace_at_offset(parent_text, keyword, cloze_marker, start_offset)
+        if not cloze_text:
+            cloze_text = _replace_at_context(parent_text, keyword, cloze_marker, before_ctx, after_ctx)
         if not cloze_text:
             cloze_text = parent_text.replace(keyword, cloze_marker, 1)
     else:
@@ -1587,7 +1628,9 @@ def _do_cloze(result):
                 search_keyword = plain_kw
         if search_keyword in old_text:
             highlighted = f'<span style="background-color:{color};color:#fff">{search_keyword}</span>'
-            new_text = _replace_at_context(old_text, search_keyword, highlighted, before_ctx, after_ctx)
+            new_text = _replace_at_offset(old_text, search_keyword, highlighted, start_offset)
+            if not new_text:
+                new_text = _replace_at_context(old_text, search_keyword, highlighted, before_ctx, after_ctx)
             if not new_text:
                 new_text = old_text.replace(search_keyword, highlighted, 1)
             if nid not in _text_history: _text_history[nid] = []
@@ -1772,31 +1815,39 @@ def _cmd_edit_last():
         note = mw.col.get_note(_last_created_nid)
         cards = note.cards()
         if not cards: tooltip("Card not found."); return
-        # Use Anki's EditCurrent which is designed to work during review
-        # It opens a non-modal editor that doesn't break the reviewer
         from aqt.editcurrent import EditCurrent
-        # Temporarily set the reviewer's card to the target card so EditCurrent edits it
+        # Remember the card currently being reviewed so we can restore it
         saved_card = mw.reviewer.card
+        saved_cid = saved_card.id if saved_card else None
+        # Temporarily set the reviewer's card to the target card so EditCurrent edits it
         mw.reviewer.card = cards[0]
         ec = EditCurrent(mw)
-        # Restore the original card after the editor opens
+        # Restore the original card immediately after the editor opens
         mw.reviewer.card = saved_card
-        # Re-bury all cards of the edited note when editor closes
+
         def _on_editor_close():
             if _last_created_nid:
                 try:
                     edited_note = mw.col.get_note(_last_created_nid)
-                    new_cids = [c.id for c in edited_note.cards()]
-                    if new_cids:
-                        mw.col.sched.bury_cards(new_cids)
-                except: pass
-            # Redraw the current review card
+                    edited_cids = [c.id for c in edited_note.cards()]
+                    # Only re-bury the edited card if it is NOT the card
+                    # currently being reviewed. If it IS the current card,
+                    # burying it would yank it out of the review and cause
+                    # Anki to advance to the next card prematurely.
+                    if edited_cids and saved_cid not in edited_cids:
+                        mw.col.sched.bury_cards(edited_cids)
+                except:
+                    pass
+            # Redraw the current review card (the one we were looking at
+            # before opening the editor) so any visual changes are reflected.
             if mw.state == "review" and saved_card:
                 try:
                     saved_card.load()
                     mw.reviewer.card = saved_card
                     mw.reviewer._redraw_current_card()
-                except: pass
+                except:
+                    pass
+
         ec.form.buttonBox.accepted.connect(_on_editor_close)
         ec.form.buttonBox.rejected.connect(_on_editor_close)
     except Exception as ex:
