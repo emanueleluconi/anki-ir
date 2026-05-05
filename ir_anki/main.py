@@ -974,14 +974,92 @@ def _cmd_extract():
             }
         }
 
-        return div.innerHTML;
+        // Compute plain-text offset of selection start, same as cloze logic.
+        // Handles both text-node and element-node startContainer.
+        var container=document.getElementById('qa')||document.body;
+        function computeOffset(refNode, refOffset){
+            var target=refNode;
+            var extraOffset=0;
+            if(target && target.nodeType===1){
+                var childIdx=Math.min(refOffset, target.childNodes.length-1);
+                if(childIdx<0){
+                    target=refNode;
+                } else {
+                    target=target.childNodes[childIdx];
+                    while(target && target.nodeType===1){
+                        if(target.firstChild) target=target.firstChild;
+                        else break;
+                    }
+                }
+            } else if(target && target.nodeType===3){
+                extraOffset=refOffset;
+            }
+            var w=document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+            var total=0;
+            var n;
+            while(n=w.nextNode()){
+                if(n===target) return total + extraOffset;
+                if(target && target.nodeType===1 && target.contains && target.contains(n)){
+                    return total;
+                }
+                total += (n.textContent||'').length;
+            }
+            return total;
+        }
+        var startOffset=computeOffset(range.startContainer, range.startOffset);
+
+        // Capture surrounding plain-text context (120 chars each side)
+        var beforeCtx='', afterCtx='';
+        try {
+            var sn=range.startContainer, so=range.startOffset;
+            var before='';
+            if(sn.nodeType===3) before=sn.textContent.substring(Math.max(0,so-120),so);
+            if(before.length<60){
+                var prev=sn.previousSibling||sn.parentNode?.previousSibling;
+                for(var i=0;i<10&&prev&&before.length<120;i++){
+                    before=(prev.textContent||'').slice(-120)+before;
+                    prev=prev.previousSibling||prev.parentNode?.previousSibling;
+                }
+            }
+            beforeCtx=before.slice(-120);
+            var en=range.endContainer, eo=range.endOffset;
+            var after='';
+            if(en.nodeType===3) after=en.textContent.substring(eo,eo+120);
+            if(after.length<60){
+                var next=en.nextSibling||en.parentNode?.nextSibling;
+                for(var i=0;i<10&&next&&after.length<120;i++){
+                    after=after+(next.textContent||'').substring(0,120);
+                    next=next.nextSibling||next.parentNode?.nextSibling;
+                }
+            }
+            afterCtx=after.substring(0,120);
+        } catch(e){}
+
+        return JSON.stringify({selHtml: div.innerHTML, startOffset: startOffset,
+                               before: beforeCtx, after: afterCtx});
     })();"""
     mw.web.evalWithCallback(js, _do_extract)
 
-def _do_extract(html):
+def _do_extract(result):
     global _last_created_nid
-    if not html or not html.strip(): tooltip("Select text first."); return
-    html = html.strip()
+    # Parse JS result: either JSON {selHtml, startOffset, before, after} or
+    # (legacy/empty) plain HTML string.
+    html = ""
+    start_offset = 0
+    before_ctx = ""
+    after_ctx = ""
+    try:
+        if isinstance(result, str) and result.strip().startswith('{'):
+            data = json.loads(result)
+            html = (data.get("selHtml") or "").strip()
+            start_offset = int(data.get("startOffset") or 0)
+            before_ctx = (data.get("before") or "").strip()
+            after_ctx = (data.get("after") or "").strip()
+        else:
+            html = (result or "").strip()
+    except Exception:
+        html = (result or "").strip() if isinstance(result, str) else ""
+    if not html: tooltip("Select text first."); return
     card = mw.reviewer.card
     if not card: return
     # Fetch parent via get_note for a guaranteed fresh object
@@ -1053,7 +1131,11 @@ def _do_extract(html):
                 search_text = plain_sel
         if search_text in old_text:
             highlighted = f'<span style="background-color:{color};color:#fff">{search_text}</span>'
-            new_text = old_text.replace(search_text, highlighted, 1)
+            new_text = _replace_at_best_match(old_text, search_text, highlighted,
+                                              plain_offset=start_offset,
+                                              before=before_ctx, after=after_ctx)
+            if not new_text:
+                new_text = old_text.replace(search_text, highlighted, 1)
             # Save for undo
             if nid not in _text_history: _text_history[nid] = []
             _text_history[nid].append(old_text)
@@ -1219,17 +1301,18 @@ def _replace_at_context(text, needle, replacement, before, after):
     return text[:best_idx] + replacement + text[best_idx + len(needle):]
 
 
-def _replace_at_offset(text, needle, replacement, plain_offset):
-    """Replace the occurrence of needle in text whose plain-text position is
-    closest to plain_offset (the JS-computed character offset of the selection
-    in the rendered card).
+def _find_best_occurrence(text, needle, plain_offset=0, before="", after=""):
+    """Find the occurrence of `needle` in `text` that best matches the
+    user's actual selection, using three signals:
 
-    This is more reliable than context-based matching because it uses the
-    exact position the user selected, not surrounding text that may repeat.
+      1. Plain-text position proximity (from JS startOffset). Primary.
+      2. Before-context match. Secondary.
+      3. After-context match. Secondary.
 
-    Returns the modified text, or None if needle is not found.
+    Returns the HTML position of the best occurrence, or None if not found.
     """
     import re as _re
+
     positions = []
     start = 0
     while True:
@@ -1241,19 +1324,75 @@ def _replace_at_offset(text, needle, replacement, plain_offset):
     if not positions:
         return None
     if len(positions) == 1:
-        return text[:positions[0]] + replacement + text[positions[0] + len(needle):]
+        return positions[0]
 
-    # Map each HTML position to its plain-text offset and pick the closest
-    best_idx = positions[0]
-    best_dist = float('inf')
+    # DO NOT strip — we need whitespace boundaries intact for exact matching.
+    before_plain = _re.sub(r'<[^>]+>', '', before or '')
+    after_plain  = _re.sub(r'<[^>]+>', '', after  or '')
+    before_tail  = before_plain[-40:] if before_plain else ""
+    after_head   = after_plain[:40]   if after_plain  else ""
+
+    needle_plain = _re.sub(r'<[^>]+>', '', needle)
+
+    best_pos = positions[0]
+    best_score = float('-inf')
+
     for pos in positions:
-        # Count plain-text characters before this HTML position
-        pt_offset = len(_re.sub(r'<[^>]+>', '', text[:pos]))
-        dist = abs(pt_offset - plain_offset)
-        if dist < best_dist:
-            best_dist = dist
-            best_idx = pos
-    return text[:best_idx] + replacement + text[best_idx + len(needle):]
+        # Map this HTML position to plain-text offset
+        pt_prefix_len = len(_re.sub(r'<[^>]+>', '', text[:pos]))
+
+        # Distance score: closer to plain_offset = higher score.
+        # Decay chosen so score halves every ~7 chars, so context (max ~200)
+        # can override when the offset is mildly off (>15 chars distance).
+        dist = abs(pt_prefix_len - plain_offset)
+        dist_score = 100.0 * (0.9 ** dist)  # dist=0 → 100, dist=20 → 12
+
+        # Context match: check text around this position in plain-text space
+        ctx_score = 0
+        if before_tail:
+            pt_before = _re.sub(r'<[^>]+>', '',
+                                text[max(0, pos - len(before_tail) * 3):pos])
+            pt_before_tail = pt_before[-len(before_tail):]
+            if pt_before_tail.endswith(before_tail):
+                ctx_score += 100
+            elif len(before_tail) >= 10 and pt_before_tail.endswith(before_tail[-10:]):
+                ctx_score += 30
+            elif len(before_tail) >= 5 and pt_before_tail.endswith(before_tail[-5:]):
+                ctx_score += 10
+
+        if after_head:
+            after_start = pos + len(needle)
+            pt_after = _re.sub(r'<[^>]+>',
+                               '',
+                               text[after_start:after_start + len(after_head) * 3])
+            pt_after_head = pt_after[:len(after_head)]
+            if pt_after_head.startswith(after_head):
+                ctx_score += 100
+            elif len(after_head) >= 10 and pt_after_head.startswith(after_head[:10]):
+                ctx_score += 30
+            elif len(after_head) >= 5 and pt_after_head.startswith(after_head[:5]):
+                ctx_score += 10
+
+        score = dist_score + ctx_score
+        if score > best_score:
+            best_score = score
+            best_pos = pos
+
+    return best_pos
+
+
+def _replace_at_best_match(text, needle, replacement, plain_offset=0,
+                           before="", after=""):
+    """Replace the best-matching occurrence of needle based on offset+context."""
+    pos = _find_best_occurrence(text, needle, plain_offset, before, after)
+    if pos is None:
+        return None
+    return text[:pos] + replacement + text[pos + len(needle):]
+
+
+def _replace_at_offset(text, needle, replacement, plain_offset):
+    """Compatibility shim: offset-only matching. Uses unified matcher."""
+    return _replace_at_best_match(text, needle, replacement, plain_offset, "", "")
 
 
 def _cmd_cloze():
@@ -1313,64 +1452,87 @@ def _cmd_cloze():
         var selHtml=div.innerHTML;
         var selText=sel.toString().trim();
         
-        // Compute character offset of selection start within the card content
-        // This is the key to finding the correct position in the source text
+        // Compute character offset of selection start within the rendered card text.
+        // This is crucial for finding the correct occurrence in the source.
+        // We handle BOTH text-node and element-node startContainer.
         var container=document.getElementById('qa')||document.body;
-        var charOffset=0;
-        var walker=document.createTreeWalker(container,NodeFilter.SHOW_TEXT);
-        var node;
-        var foundStart=false;
-        while(node=walker.nextNode()){
-            if(node===range.startContainer){
-                charOffset+=range.startOffset;
-                foundStart=true;
-                break;
+
+        function computeOffset(refNode, refOffset){
+            // If refNode is an element, resolve to the equivalent text position
+            // by descending into the refOffset-th child.
+            var target=refNode;
+            var extraOffset=0;
+            if(target && target.nodeType===1){
+                // Element node: refOffset is a child index. Walk to that child,
+                // then sum all text node lengths BEFORE it in the container.
+                var childIdx=Math.min(refOffset, target.childNodes.length-1);
+                if(childIdx<0){
+                    // Empty element — use the element itself as boundary
+                    target=refNode;
+                } else {
+                    target=target.childNodes[childIdx];
+                    // If that child is still an element, descend to its leftmost text descendant
+                    while(target && target.nodeType===1){
+                        if(target.firstChild) target=target.firstChild;
+                        else break;
+                    }
+                    extraOffset=0; // we're at the start of this text node
+                }
+            } else if(target && target.nodeType===3){
+                extraOffset=refOffset;
             }
-            charOffset+=(node.textContent||'').length;
-        }
-        var startOffset=foundStart?charOffset:0;
-        
-        // Also compute end offset
-        charOffset=0;
-        walker=document.createTreeWalker(container,NodeFilter.SHOW_TEXT);
-        var foundEnd=false;
-        while(node=walker.nextNode()){
-            if(node===range.endContainer){
-                charOffset+=range.endOffset;
-                foundEnd=true;
-                break;
+            // Now walk text nodes in container up to target, accumulating length
+            var walker=document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+            var total=0;
+            var node;
+            while(node=walker.nextNode()){
+                if(node===target){
+                    return total + extraOffset;
+                }
+                // If target is an element we couldn't descend into, stop when we pass it
+                if(target && target.nodeType===1){
+                    // Check if target contains this text node — if yes, we've gone too far
+                    if(target.contains && target.contains(node)){
+                        return total; // approximate: position of element in text flow
+                    }
+                }
+                total += (node.textContent||'').length;
             }
-            charOffset+=(node.textContent||'').length;
+            // Not found — return total (end of container)
+            return total;
         }
-        var endOffset=foundEnd?charOffset:startOffset+selText.length;
+
+        var startOffset=computeOffset(range.startContainer, range.startOffset);
+        var endOffset=computeOffset(range.endContainer, range.endOffset);
+        if(endOffset<=startOffset) endOffset=startOffset+selText.length;
         
-        // Get context
+        // Get longer context (120 chars each side) for fallback matching
         var beforeCtx='', afterCtx='';
         try {
             var sn=range.startContainer;
             var so=range.startOffset;
             var before='';
-            if(sn.nodeType===3) before=sn.textContent.substring(Math.max(0,so-60),so);
-            if(before.length<30){
+            if(sn.nodeType===3) before=sn.textContent.substring(Math.max(0,so-120),so);
+            if(before.length<60){
                 var prev=sn.previousSibling||sn.parentNode?.previousSibling;
-                for(var i=0;i<5&&prev&&before.length<60;i++){
-                    before=(prev.textContent||'').slice(-60)+before;
+                for(var i=0;i<10&&prev&&before.length<120;i++){
+                    before=(prev.textContent||'').slice(-120)+before;
                     prev=prev.previousSibling||prev.parentNode?.previousSibling;
                 }
             }
-            beforeCtx=before.slice(-60);
+            beforeCtx=before.slice(-120);
             var en=range.endContainer;
             var eo=range.endOffset;
             var after='';
-            if(en.nodeType===3) after=en.textContent.substring(eo,eo+60);
-            if(after.length<30){
+            if(en.nodeType===3) after=en.textContent.substring(eo,eo+120);
+            if(after.length<60){
                 var next=en.nextSibling||en.parentNode?.nextSibling;
-                for(var i=0;i<5&&next&&after.length<60;i++){
-                    after=after+(next.textContent||'').substring(0,60);
+                for(var i=0;i<10&&next&&after.length<120;i++){
+                    after=after+(next.textContent||'').substring(0,120);
                     next=next.nextSibling||next.parentNode?.nextSibling;
                 }
             }
-            afterCtx=after.substring(0,60);
+            afterCtx=after.substring(0,120);
         } catch(e){}
         return JSON.stringify({selHtml:selHtml,selText:selText,before:beforeCtx,after:afterCtx,startOffset:startOffset,endOffset:endOffset});
     })();"""
@@ -1559,14 +1721,12 @@ def _do_cloze(result):
     
     cloze_marker = "{{c1::" + keyword + "}}"
     
-    # Build cloze text: the FULL parent text with the keyword wrapped in cloze
-    # This ensures all surrounding context is preserved in the cloze card.
-    # Prefer offset-based replacement (exact position from JS selection),
-    # fall back to context-based, then to first-occurrence.
+    # Build cloze text: the FULL parent text with the keyword wrapped in cloze.
+    # Use unified offset + context matching for the best occurrence.
     if keyword in parent_text:
-        cloze_text = _replace_at_offset(parent_text, keyword, cloze_marker, start_offset)
-        if not cloze_text:
-            cloze_text = _replace_at_context(parent_text, keyword, cloze_marker, before_ctx, after_ctx)
+        cloze_text = _replace_at_best_match(parent_text, keyword, cloze_marker,
+                                            plain_offset=start_offset,
+                                            before=before_ctx, after=after_ctx)
         if not cloze_text:
             cloze_text = parent_text.replace(keyword, cloze_marker, 1)
     else:
@@ -1628,9 +1788,9 @@ def _do_cloze(result):
                 search_keyword = plain_kw
         if search_keyword in old_text:
             highlighted = f'<span style="background-color:{color};color:#fff">{search_keyword}</span>'
-            new_text = _replace_at_offset(old_text, search_keyword, highlighted, start_offset)
-            if not new_text:
-                new_text = _replace_at_context(old_text, search_keyword, highlighted, before_ctx, after_ctx)
+            new_text = _replace_at_best_match(old_text, search_keyword, highlighted,
+                                              plain_offset=start_offset,
+                                              before=before_ctx, after=after_ctx)
             if not new_text:
                 new_text = old_text.replace(search_keyword, highlighted, 1)
             if nid not in _text_history: _text_history[nid] = []
@@ -1808,7 +1968,16 @@ def _cmd_forget():
     tooltip("Forgotten"); mw.reviewer.nextCard()
 
 def _cmd_edit_last():
-    """Open the last created note for editing using Anki's built-in editor."""
+    """Open the last created note (cloze or extract) for editing.
+
+    Does NOT bury the edited card's cards — clozes are already buried at
+    creation time in _do_cloze, and re-burying via OpChanges(study_queues=True)
+    would cause Anki's reviewer to advance past the current card. That's the
+    bug we are explicitly avoiding here.
+
+    The editor's own operation_did_execute handler triggers a note_text
+    refresh, which only redraws the current card without changing queue state.
+    """
     global _last_created_nid
     if not _last_created_nid: tooltip("No recent card."); return
     try:
@@ -1816,36 +1985,24 @@ def _cmd_edit_last():
         cards = note.cards()
         if not cards: tooltip("Card not found."); return
         from aqt.editcurrent import EditCurrent
-        # Remember the card currently being reviewed so we can restore it
+
+        # Temporarily retarget the reviewer so EditCurrent edits our created note
         saved_card = mw.reviewer.card
-        saved_cid = saved_card.id if saved_card else None
-        # Temporarily set the reviewer's card to the target card so EditCurrent edits it
         mw.reviewer.card = cards[0]
         ec = EditCurrent(mw)
-        # Restore the original card immediately after the editor opens
+        # Restore the original card immediately after editor opens
         mw.reviewer.card = saved_card
 
+        # When the editor closes, only redraw the current review card.
+        # Do NOT call bury_cards here — that would trigger a queue refresh
+        # and advance past the current card.
         def _on_editor_close():
-            if _last_created_nid:
-                try:
-                    edited_note = mw.col.get_note(_last_created_nid)
-                    edited_cids = [c.id for c in edited_note.cards()]
-                    # Only re-bury the edited card if it is NOT the card
-                    # currently being reviewed. If it IS the current card,
-                    # burying it would yank it out of the review and cause
-                    # Anki to advance to the next card prematurely.
-                    if edited_cids and saved_cid not in edited_cids:
-                        mw.col.sched.bury_cards(edited_cids)
-                except:
-                    pass
-            # Redraw the current review card (the one we were looking at
-            # before opening the editor) so any visual changes are reflected.
             if mw.state == "review" and saved_card:
                 try:
                     saved_card.load()
                     mw.reviewer.card = saved_card
                     mw.reviewer._redraw_current_card()
-                except:
+                except Exception:
                     pass
 
         ec.form.buttonBox.accepted.connect(_on_editor_close)
