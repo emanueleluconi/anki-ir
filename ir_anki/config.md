@@ -54,6 +54,7 @@ Sources use a **fixed cadence**: the A-Factor is pinned to 1.0 so the interval n
 - `zotero_api_key`: Zotero API key.
 - `zotero_import_tag`: Tag that marks items to import as sources. Default: `IR`
 - `zotero_highlight_color`: Highlight color imported as extracts. Default: `#ffd400`
+- `zotero_extract_cutoff_date`: Only import extracts (annotations/notes) created on or after this date (`YYYY-MM-DD`). Sources always import. Default: `2026-06-13`. Set this to "now" before a wipe-and-resync so old highlights aren't re-imported as duplicates. Sync only fetches annotations newer than this date, so a later cutoff also makes syncing faster.
 
 **Menu → IR:**
 - `Sources in Progress`: window listing all not-done sources ordered by priority (highest on top); change priority of one or many at once, propagated proportionally to child extracts.

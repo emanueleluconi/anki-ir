@@ -27,6 +27,7 @@ def show_settings():
         "key_prepare": "Ctrl+Shift+p", "key_zotero_sync": "Ctrl+Shift+y",
         "zotero_library_id": "", "zotero_api_key": "",
         "zotero_import_tag": "IR", "zotero_highlight_color": "#ffd400",
+        "zotero_extract_cutoff_date": "2026-06-13",
     }
     for k, v in defaults.items():
         if k not in conf: conf[k] = v
@@ -118,6 +119,7 @@ def show_settings():
         ("zotero_api_key", "API Key", "str"),
         ("zotero_import_tag", "Import tag (sources)", "str"),
         ("zotero_highlight_color", "Highlight color (extracts)", "str"),
+        ("zotero_extract_cutoff_date", "Extract cutoff date (YYYY-MM-DD)", "str"),
     ])
 
     container.setLayout(layout)
@@ -140,8 +142,11 @@ def show_settings():
 
     # Buttons (outside scroll area, always visible)
     btn_row = QHBoxLayout()
+    restore_btn = QPushButton("Restore Defaults")
+    restore_btn.setToolTip("Reset all settings to their default values.")
     save_btn = QPushButton("Save")
     cancel_btn = QPushButton("Cancel")
+    btn_row.addWidget(restore_btn)
     btn_row.addStretch()
     btn_row.addWidget(save_btn)
     btn_row.addWidget(cancel_btn)
@@ -158,6 +163,23 @@ def show_settings():
         mw.addonManager.writeConfig(__name__.split(".")[0], conf)
         dlg.accept()
 
+    def do_restore_defaults():
+        from aqt.utils import askUser
+        if not askUser("Restore all Incremental Reading settings to their defaults?\n"
+                       "This overwrites your current settings."):
+            return
+        addon = __name__.split(".")[0]
+        # Prefer the shipped config.json defaults; fall back to the built-in map.
+        try:
+            shipped = mw.addonManager.addonConfigDefaults(addon)
+        except Exception:
+            shipped = None
+        new_conf = dict(shipped) if shipped else {**conf, **defaults}
+        mw.addonManager.writeConfig(addon, new_conf)
+        dlg.accept()
+        show_settings()  # reopen with the restored values
+
+    restore_btn.clicked.connect(do_restore_defaults)
     save_btn.clicked.connect(save)
     cancel_btn.clicked.connect(dlg.reject)
     dlg.setLayout(dlg_layout)

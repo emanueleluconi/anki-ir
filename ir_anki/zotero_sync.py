@@ -15,9 +15,9 @@ Cards are created directly — no Prepare Topics needed after sync.
 import json
 import os
 import re
-from datetime import date
 from urllib.request import Request, urlopen
 from urllib.error import URLError
+from urllib.parse import quote
 
 from anki.notes import Note
 from aqt import mw
@@ -35,6 +35,7 @@ def _cfg(key):
         "default_priority": 50,
         "zotero_library_id": "", "zotero_api_key": "",
         "zotero_import_tag": "IR", "zotero_highlight_color": "#ffd400",
+        "zotero_extract_cutoff_date": "2026-06-13",
     }.get(key))
 
 
@@ -105,6 +106,122 @@ def _bib_parent(key):
             return None
         cur = _get_item(pk)
     return None
+
+
+def _fetch_tagged(tag):
+    """Fetch ALL items carrying a given tag (version-independent).
+
+    This is the reliable way to detect items the user just tagged: it does not
+    depend on library-version bookkeeping, so 'tag it → sync → imported' always
+    works, even on a freshly reset state.
+    """
+    items, start = [], 0
+    enc = quote(tag, safe="")
+    while True:
+        r = _api(f"items?tag={enc}&limit=100&start={start}")
+        if not r or r[0] != 200:
+            break
+        batch = json.loads(r[2])
+        if not batch:
+            break
+        items.extend(batch)
+        if len(batch) < 100:
+            break
+        start += 100
+    return items
+
+
+def _children(key):
+    """Fetch direct child items of an item (attachments, notes, annotations)."""
+    items, start = [], 0
+    while True:
+        r = _api(f"items/{key}/children?limit=100&start={start}")
+        if not r or r[0] != 200:
+            break
+        batch = json.loads(r[2])
+        if not batch:
+            break
+        items.extend(batch)
+        if len(batch) < 100:
+            break
+        start += 100
+    return items
+
+
+def _descendant_annotations(source_key):
+    """All notes/annotations belonging to a source.
+
+    Source → child notes (standalone notes) and child attachments;
+    attachment → annotations (highlights, sticky notes). Walks two levels deep,
+    which covers Zotero's PDF/HTML annotation structure.
+    """
+    out = []
+    for ch in _children(source_key):
+        t = ch["data"].get("itemType", "")
+        if t in ("note", "annotation"):
+            out.append(ch)
+        elif t == "attachment":
+            for gch in _children(ch["key"]):
+                if gch["data"].get("itemType", "") in ("note", "annotation"):
+                    out.append(gch)
+    return out
+
+
+def _fetch_recent(item_type, cutoff):
+    """Fetch items of a type, newest first, stopping once we pass the cutoff.
+
+    Because results are sorted by dateAdded descending, we can stop paginating
+    as soon as we hit an item older than the cutoff. This keeps the sync fast:
+    we only ever pull the annotations/notes created on or after the cutoff
+    instead of the entire library.
+    """
+    items, start = [], 0
+    while True:
+        r = _api(f"items?itemType={item_type}&sort=dateAdded&direction=desc&limit=100&start={start}")
+        if not r or r[0] != 200:
+            break
+        batch = json.loads(r[2])
+        if not batch:
+            break
+        stop = False
+        for it in batch:
+            dadd = (it["data"].get("dateAdded") or "")[:10]
+            if cutoff and dadd and dadd < cutoff:
+                stop = True
+                break
+            items.append(it)
+        if stop or len(batch) < 100:
+            break
+        start += 100
+    return items
+
+
+def _imported_keys(src_tag, ext_tag):
+    """Collect, in ONE query, the Zotero keys already imported.
+
+    Returns (source_keys, all_keys). Scans only IR notes (by tag) once and
+    regex-extracts their SourceID/NoteID keys, instead of running a full-table
+    'flds LIKE' scan per item — which is what made re-syncs extremely slow.
+    """
+    source_keys, all_keys = set(), set()
+    if not mw.col:
+        return source_keys, all_keys
+    try:
+        rows = mw.col.db.all(
+            "SELECT flds, tags FROM notes WHERE tags LIKE ? OR tags LIKE ?",
+            f"%{src_tag}%", f"%{ext_tag}%",
+        )
+    except Exception:
+        rows = []
+    pat = re.compile(r"(?:SourceID|NoteID):\s*([A-Za-z0-9]{6,})")
+    for flds, tags in rows:
+        found = pat.findall(flds or "")
+        for k in found:
+            all_keys.add(k)
+        if src_tag in (tags or ""):
+            for k in found:
+                source_keys.add(k)
+    return source_keys, all_keys
 
 
 # ============================================================
@@ -366,6 +483,27 @@ def _exists(zotero_key):
         return False
 
 
+def _source_exists(zotero_key, src_tag):
+    """Check whether a SOURCE note for this Zotero key already exists.
+
+    A source's key (SourceID) is also embedded in every one of its extracts, so a
+    plain key search would report the source as 'existing' whenever any extract
+    survives. We therefore require the note to also carry the source tag, which
+    extracts never have. This keeps source import independent of extracts.
+    """
+    if not mw.col:
+        return False
+    try:
+        rows = mw.col.db.list(
+            "SELECT id FROM notes WHERE flds LIKE ? AND tags LIKE ?",
+            f"%{zotero_key}%", f"%{src_tag}%"
+        )
+        return len(rows) > 0
+    except Exception:
+        # Conservative fallback: treat as missing so we don't silently skip it.
+        return False
+
+
 # ============================================================
 # Note creation
 # ============================================================
@@ -465,160 +603,138 @@ def _clean_annotation_text(text):
 # ============================================================
 
 def sync():
-    """Sync from Zotero. Returns (sources_created, extracts_created)."""
+    """Sync from Zotero. Returns (sources_created, extracts_created).
+
+    Tag-driven and version-independent: every item carrying the import tag is
+    scanned (and its annotations/notes), importing whatever is not already in
+    the collection. This makes 'tag an item → sync → imported' reliable, even
+    right after resetting the sync state.
+    """
     lib_id = _cfg("zotero_library_id")
     api_key = _cfg("zotero_api_key")
     if not lib_id or not api_key:
         showInfo("Zotero: Set Library ID and API Key in IR → Zotero Settings first.")
         return 0, 0
 
-    state = _load_state()
     _cache.clear()
+    state = _load_state()
 
+    # Validate credentials / connectivity (also used to stamp last_sync).
     cur_ver = _lib_version()
     if cur_ver is None:
         showInfo("Zotero: Failed to connect. Check your Library ID and API Key.")
         return 0, 0
 
-    # First run: set baseline to current version (no big initial pull)
-    if "last_sync" not in state:
-        state["last_sync"] = cur_ver
-        _save_state(state)
-        showInfo(f"Zotero: First run — baseline set to version {cur_ver}.\nFuture syncs will pull new changes.")
-        return 0, 0
-
-    start_ver = state["last_sync"]
-    if start_ver >= cur_ver:
-        tooltip("Zotero: Already up to date.")
-        return 0, 0
-
-    items = _fetch_since(start_ver)
-    if not items:
-        state["last_sync"] = cur_ver
-        _save_state(state)
-        tooltip("Zotero: No new items.")
-        return 0, 0
-
-    for it in items:
-        _cache[it["key"]] = it
-
-    import_tag = (_cfg("zotero_import_tag") or "IR").lower()
+    import_tag = _cfg("zotero_import_tag") or "IR"
     hl_color = (_cfg("zotero_highlight_color") or "#ffd400").lower()
     src_tag = _cfg("source_tag") or "ir::source"
     ext_tag = _cfg("extract_tag") or "ir::extract"
+    # Extracts (annotations/notes) are only imported if created on/after this
+    # cutoff date. Sources always import. This guards against re-importing old
+    # highlights after a wipe-and-resync.
+    cutoff = (_cfg("zotero_extract_cutoff_date") or "").strip()
+
+    # Prefetch already-imported keys ONCE (fast), instead of scanning per item.
+    source_keys, existing_keys = _imported_keys(src_tag, ext_tag)
+
+    tagged = _fetch_tagged(import_tag)
+    # Sources = bibliographic (top-level) items carrying the tag.
+    source_items = [it for it in tagged
+                    if it["data"].get("itemType", "") not in ("attachment", "note", "annotation")]
+
+    if not source_items:
+        state["last_sync"] = cur_ver
+        _save_state(state)
+        showInfo(f"Zotero: no items tagged '{import_tag}' were found.\n"
+                 f"Make sure the tag matches exactly (it is case-sensitive) and that "
+                 f"the item is tagged in Zotero, then sync.")
+        return 0, 0
+
     sources, extracts = 0, 0
+    tagged_source_keys = set()
 
-    # Pass 1: Sources
-    for it in items:
-        d = it["data"]
-        key = it["key"]
-        if d.get("itemType", "") in ("attachment", "note", "annotation"):
+    # Pass 1: sources (always imported if missing).
+    for src in source_items:
+        skey = src["key"]
+        _cache[skey] = src
+        tagged_source_keys.add(skey)
+        d = src["data"]
+        if skey in source_keys:
             continue
-        if not any(t.get("tag", "").lower() == import_tag for t in d.get("tags", [])):
-            continue
-        if _exists(key):
-            continue
-
         title, year, authors = _item_data(d)
         ref, tag, ra = _fmt_authors(authors, year, title)
         yr = f" ({year})" if year else ""
         text = _fmt_math(f"{title}, {ra}{yr}")
-        back = f'<a href="zotero://select/library/items/{key}">SourceID: {key}</a>'
+        back = f'<a href="zotero://select/library/items/{skey}">SourceID: {skey}</a>'
         url = d.get("url", "").strip()
         if url:
             back += f'<br><a href="{url}">{url}</a>'
-        tags = f"{tag} {src_tag}"
-
-        if _create_note(text, ref, back, tags):
+        if _create_note(text, ref, back, f"{tag} {src_tag}"):
             sources += 1
+            source_keys.add(skey)
 
-    # Pass 2: Annotations → extracts
-    # Handles: (a) colored highlights, (b) sticky note annotations
-    for it in items:
-        d = it["data"]
-        key = it["key"]
-        itype = d.get("itemType", "")
+    # Pass 2: extracts. Only recent annotations/notes (>= cutoff) are pulled,
+    # in bulk, then matched to a tagged source via their parent chain. This is
+    # far faster than enumerating every source's children every sync.
+    recent = _fetch_recent("annotation", cutoff) + _fetch_recent("note", cutoff)
+    for it in recent:
+        ckey = it["key"]
+        cd = it["data"]
+        itype = cd.get("itemType", "")
+        if ckey in existing_keys:
+            continue
+        created = (cd.get("dateAdded") or cd.get("dateModified") or "")
+        if cutoff and created and created[:10] < cutoff:
+            continue
+
+        _cache[ckey] = it
+        parent = _bib_parent(ckey)
+        if not parent or parent["key"] not in tagged_source_keys:
+            continue
+        skey = parent["key"]
+        title, year, authors = _item_data(parent["data"])
+        ref, tag, _ = _fmt_authors(authors, year, title)
 
         if itype == "annotation":
-            ann_type = d.get("annotationType", "")
-            ann_color = (d.get("annotationColor") or "").lower()
-            hl_text = (d.get("annotationText") or "").strip()
-            comment = (d.get("annotationComment") or "").strip()
-
-            # Determine if this annotation should be imported:
-            # (a) Highlight with matching color and text
-            # (b) Sticky note annotation (annotationType="note") with comment
+            ann_type = cd.get("annotationType", "")
+            ann_color = (cd.get("annotationColor") or "").lower()
+            hl_text = (cd.get("annotationText") or "").strip()
+            comment = (cd.get("annotationComment") or "").strip()
             is_highlight = hl_text and ann_color == hl_color
             is_sticky_note = ann_type == "note" and comment
-
             if not is_highlight and not is_sticky_note:
                 continue
-            if _exists(key):
-                continue
 
-            parent = _bib_parent(key)
-            if not parent:
-                continue
-            # Only import extracts whose parent article has the import tag
-            if not any(t.get("tag", "").lower() == import_tag for t in parent["data"].get("tags", [])):
-                continue
-            title, year, authors = _item_data(parent["data"])
-            ref, tag, _ = _fmt_authors(authors, year, title)
-
-            # Build the text content
             if is_highlight:
                 combined = _clean_annotation_text(hl_text)
                 if comment:
                     combined += f"<br><br>{comment}"
             else:
-                # Sticky note: comment is the main content
                 combined = comment
-            # \xa0 (non-breaking space) is used by Zotero as a line separator;
-            # strip it before converting newlines so it doesn't swallow breaks
             combined = combined.replace("\xa0\n", "\n").replace("\xa0", " ")
-            # Convert Markdown formatting to HTML before math/line break conversion
             combined = _md_to_html(combined)
-            # Convert math BEFORE \n→<br> so the [^$\n] constraint in the inline
-            # math regex correctly prevents cross-line currency false matches
             combined = _fmt_math(combined)
             combined = _newlines_to_br(combined)
 
-            pk = parent["key"]
-            # Build open-pdf link: parentItem is the PDF attachment key
-            att_key = d.get("parentItem", "")
-            page = d.get("annotationPageLabel", "")
-            note_url = f"zotero://open-pdf/library/items/{att_key}?page={page}&annotation={key}" if att_key else f"zotero://select/library/items/{key}"
-            back = (f'<a href="zotero://select/library/items/{pk}">SourceID: {pk}</a>'
-                    f'<br><a href="{note_url}">NoteID: {key}</a>')
-            tags = f"{tag} {ext_tag}"
-
-            if _create_note(combined, ref, back, tags):
+            att_key = cd.get("parentItem", "")
+            page = cd.get("annotationPageLabel", "")
+            note_url = (f"zotero://open-pdf/library/items/{att_key}?page={page}&annotation={ckey}"
+                        if att_key else f"zotero://select/library/items/{ckey}")
+            back = (f'<a href="zotero://select/library/items/{skey}">SourceID: {skey}</a>'
+                    f'<br><a href="{note_url}">NoteID: {ckey}</a>')
+            if _create_note(combined, ref, back, f"{tag} {ext_tag}"):
                 extracts += 1
+                existing_keys.add(ckey)
 
         elif itype == "note":
-            note_html = d.get("note", "")
-            plain = _note_html_to_anki(note_html)
+            plain = _note_html_to_anki(cd.get("note", ""))
             if not plain:
                 continue
-            if _exists(key):
-                continue
-
-            parent = _bib_parent(key)
-            if not parent:
-                continue
-            # Only import notes whose parent article has the import tag
-            if not any(t.get("tag", "").lower() == import_tag for t in parent["data"].get("tags", [])):
-                continue
-            title, year, authors = _item_data(parent["data"])
-            ref, tag, _ = _fmt_authors(authors, year, title)
-
-            pk = parent["key"]
-            back = (f'<a href="zotero://select/library/items/{pk}">SourceID: {pk}</a>'
-                    f'<br><a href="zotero://select/library/items/{key}">NoteID: {key}</a>')
-            tags = f"{tag} {ext_tag}"
-
-            if _create_note(_newlines_to_br(_fmt_math(plain)), ref, back, tags):
+            back = (f'<a href="zotero://select/library/items/{skey}">SourceID: {skey}</a>'
+                    f'<br><a href="zotero://select/library/items/{ckey}">NoteID: {ckey}</a>')
+            if _create_note(_newlines_to_br(_fmt_math(plain)), ref, back, f"{tag} {ext_tag}"):
                 extracts += 1
+                existing_keys.add(ckey)
 
     state["last_sync"] = cur_ver
     _save_state(state)
@@ -626,6 +742,7 @@ def sync():
 
 
 def reset_state():
-    """Reset sync state. Next sync sets a new baseline."""
+    """Reset sync state. Sync is tag-driven, so this only clears bookkeeping;
+    the next sync re-scans all tagged items and imports anything missing."""
     _save_state({})
-    tooltip("Zotero sync state reset. Next sync will set a new baseline.")
+    tooltip("Zotero sync state reset. Next sync re-scans all tagged items.")
