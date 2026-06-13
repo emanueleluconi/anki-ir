@@ -84,15 +84,21 @@ def is_topic(note) -> bool:
 
 # ── Initialisation helpers ────────────────────────────────────────────────────
 
-def init_source(note, priority: float = 50.0, cap: int = 0):
-    """Initialise a brand-new source note with the given priority and cap."""
+def init_source(note, priority: float = 50.0, cap: int = 0, interval: int = 3):
+    """Initialise a brand-new source note.
+
+    Sources use a FIXED cadence: AF is pinned to 1.0 so the interval never
+    grows on its own, and the interval defaults to `interval` days (3). The
+    interval only changes when the user explicitly reschedules. Priority still
+    drives queue ordering.
+    """
     p = scheduler.clamp_priority(priority)
     m = dict(DEFAULT)
     m["p"]   = p
-    m["iv"]  = 1
-    m["af"]  = scheduler.af_from_priority(p)
+    m["iv"]  = max(1, int(interval))
+    m["af"]  = 1.0
     m["cap"] = int(cap) if cap else 0
-    m["due"] = scheduler.date_from_days(1)
+    m["due"] = scheduler.date_from_days(m["iv"])
     put(note, m)
 
 

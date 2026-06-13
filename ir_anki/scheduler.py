@@ -66,6 +66,41 @@ def af_from_priority(p: float) -> float:
     return _clamp_af(af)
 
 
+# Bounds on how far a single manual interval change may swing priority.
+# SuperMemo expresses priority changes multiplicatively (e.g. Priority : Increase
+# multiplies the percent by 0.5, Priority : Decrease by 1.5). We mirror that, but
+# clamp the multiplier so one reschedule cannot violently reprioritise.
+_PRIORITY_COUPLING_MIN_RATIO = 0.2   # strongest single boost: percent ×0.2
+_PRIORITY_COUPLING_MAX_RATIO = 5.0   # strongest single drop:  percent ×5.0
+
+
+def couple_priority_to_interval(old_priority: float, old_iv: int, new_iv: int) -> float:
+    """Adjust priority when the user manually changes a topic's interval.
+
+    SuperMemo (Help: Priority queue / Incremental reading): "If you manually
+    change the interval, element priorities will change. If you shorten the
+    interval, the priority will automatically increase. If you delay the next
+    repetition, the priority will drop."
+
+    SuperMemo changes priority multiplicatively on the percent value, so we scale
+    the priority percent by the interval ratio (new_iv / old_iv): halving the
+    interval roughly halves the percent (≈ doubles importance); doubling the
+    interval roughly doubles the percent (lower importance). Lower percent = higher
+    priority, so a shorter interval (ratio < 1) yields a lower percent = higher
+    priority, exactly as SuperMemo describes.
+
+    Note (matches SuperMemo): because the change is multiplicative on the percent,
+    a priority already at 0% cannot be pushed lower, and delaying it barely moves it.
+    """
+    old_iv = max(1, int(old_iv))
+    new_iv = max(1, int(new_iv))
+    if new_iv == old_iv:
+        return clamp_priority(old_priority)
+    ratio = new_iv / old_iv
+    ratio = max(_PRIORITY_COUPLING_MIN_RATIO, min(_PRIORITY_COUPLING_MAX_RATIO, ratio))
+    return clamp_priority(old_priority * ratio)
+
+
 # ── Interval computation ─────────────────────────────────────────────────────
 
 def next_interval(iv: int, af: float, cap: int = 0) -> int:

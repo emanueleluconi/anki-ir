@@ -39,8 +39,9 @@ def cfg(key):
         "auto_postpone": False, "postpone_protection": 30, "mercy_days": 14,
         "topic_item_ratio": 5,
         # Per-tag default interval caps (0 = no cap)
-        "source_cap_default": 14,   # sources: cap at 14 days by default
+        "source_cap_default": 0,    # sources: fixed cadence, no cap by default
         "extract_cap_default": 0,   # extracts: no cap by default
+        "source_default_interval": 3,  # sources: presented every N days by default
         "source_tag": "ir::source", "extract_tag": "ir::extract",
         "highlight_extract": "#5b9bd5", "highlight_cloze": "#c9a227",
         "key_extract": "x", "key_cloze": "z", "key_priority": "Shift+p",
@@ -51,8 +52,29 @@ def cfg(key):
         "key_edit_last": "Shift+e", "key_undo_text": "Alt+z",
         "key_undo_answer": "Ctrl+Shift+z",
         "key_prepare": "Ctrl+Shift+p",
+        "key_zotero_sync": "Ctrl+Shift+y",
     }
     return c.get(key, defaults.get(key))
+
+
+def _is_source(note) -> bool:
+    """True if the note is an IR source (vs an extract)."""
+    try:
+        return cfg("source_tag") in note.tags
+    except Exception:
+        return False
+
+
+def _af_for_note(note, p: float) -> float:
+    """A-Factor to use for a note at priority p.
+
+    Sources use a fixed cadence (AF pinned to 1.0 — interval never grows on its
+    own; only explicit reschedules change it). Extracts use the priority-derived
+    concave AF curve, exactly as before.
+    """
+    if _is_source(note):
+        return 1.0
+    return scheduler.af_from_priority(p)
 
 
 def _default_cap_for_note(note) -> int:
@@ -310,14 +332,17 @@ def _ask_new_source_priority(sources):
         else:
             p = scheduler.clamp_priority(default_p)
         # NOW init the source with the chosen priority
-        init_source(note, p, cap=_default_cap_for_note(note))
+        init_source(note, p, cap=_default_cap_for_note(note),
+                    interval=int(cfg("source_default_interval") or 3))
         mw.col.update_note(note)
+        m = get(note)
         due_today = result[0] == "apply" and item["today"]
         if due_today:
-            m = get(note)
-            m["due"] = scheduler.today_str(); m["iv"] = 1
+            m["due"] = scheduler.today_str()
             save_meta(note.id, m)
-        _set_review(card, 1, 0 if due_today else 1)
+        # Keep the source's fixed interval (don't reset to 1); just control
+        # whether it shows today or after one interval.
+        _set_review(card, max(1, m["iv"]), 0 if due_today else max(1, m["iv"]))
 
 
 # ============================================================
@@ -627,6 +652,11 @@ def _custom_answer_card(self, ease, _old):
     if len(_answer_history) > 50:
         _answer_history.pop(0)
 
+    # Sources use a fixed cadence: pin AF to 1.0 so the interval never grows.
+    # This also lazily migrates any source created before fixed-cadence mode.
+    if _is_source(note) and m["af"] != 1.0:
+        m["af"] = 1.0
+
     today_iso = date.today().isoformat()
     is_due = not m["due"] or m["due"] <= today_iso
 
@@ -655,8 +685,10 @@ def _custom_answer_card(self, ease, _old):
 
 def _custom_answer_buttons(self, _old):
     if self.card and _is_topic_card(self.card):
-        m = get(self.card.note())
-        next_iv = scheduler.next_interval(m["iv"], m["af"], cap=m.get("cap", 0))
+        note = self.card.note()
+        m = get(note)
+        af = _af_for_note(note, m["p"])
+        next_iv = scheduler.next_interval(m["iv"], af, cap=m.get("cap", 0))
         return ((1, f"Next ({next_iv}d)"),)
     return _old(self)
 
@@ -913,132 +945,231 @@ def _set_shortcuts(shortcuts):
 # Commands
 # ============================================================
 
+# ------------------------------------------------------------
+# Selection capture (ported from ir_extract_cloze)
+# ------------------------------------------------------------
+#
+# Shared by both the extract and cloze commands. Runs in the reviewer webview
+# and returns JSON:
+#   { selHtml, selText, before, after, startOffset, endOffset }
+# with rendered <mjx-container> MathJax replaced by the original
+# \\(...\\) / \\[...\\] LaTeX so child notes store renderable source.
+#
+# Capturing the plain-text start/end offsets plus surrounding context is what
+# lets the Python side wrap/highlight the SELECTED occurrence rather than the
+# first textual match — the key to not "spotting the wrong piece of text" when
+# the same string recurs in the note. Deliberately avoids the `?.` optional
+# chaining operator, which is not reliably parsed by all Anki Qt webviews.
+
+_CAPTURE_JS = r"""(function(){
+    var sel=window.getSelection();
+    if(!sel||sel.isCollapsed)return JSON.stringify({err:1});
+    var range=sel.getRangeAt(0);
+    var div=document.createElement('div');
+    div.appendChild(range.cloneContents());
+
+    // Map rendered <mjx-container> -> original LaTeX via MathJax 3 doc.
+    var texMap=new Map();
+    try{
+        var mathDoc=MathJax.startup.document;
+        if(mathDoc&&mathDoc.math){
+            for(var item of mathDoc.math){
+                if(item.typesetRoot){
+                    var delim=item.display?['\\[','\\]']:['\\(','\\)'];
+                    texMap.set(item.typesetRoot,delim[0]+item.math+delim[1]);
+                }
+            }
+        }
+    }catch(e){}
+
+    // Match cloned mjx-containers to originals by selection order.
+    var origContainers=[];
+    var tw=document.createTreeWalker(
+        range.commonAncestorContainer.nodeType===1?range.commonAncestorContainer:range.commonAncestorContainer.parentNode,
+        NodeFilter.SHOW_ELEMENT,
+        {acceptNode:function(n){return n.tagName==='MJX-CONTAINER'?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_SKIP;}}
+    );
+    var n;
+    while(n=tw.nextNode()){ if(range.intersectsNode(n)) origContainers.push(n); }
+    var cloneContainers=div.querySelectorAll('mjx-container');
+    for(var i=0;i<cloneContainers.length;i++){
+        var tex=null;
+        if(i<origContainers.length) tex=texMap.get(origContainers[i]);
+        if(!tex){
+            var mml=cloneContainers[i].querySelector('mjx-assistive-mml math');
+            if(mml){
+                var isBlock=mml.getAttribute('display')==='block'||cloneContainers[i].getAttribute('display')==='true';
+                tex=(isBlock?'\\[':'\\(')+mml.textContent.trim()+(isBlock?'\\]':'\\)');
+            }
+        }
+        if(tex) cloneContainers[i].replaceWith(document.createTextNode(tex));
+    }
+
+    var selHtml=div.innerHTML;
+    var selText=sel.toString().trim();
+
+    // Plain-text offset of selection start within the card content.
+    var container=document.getElementById('qa')||document.body;
+    function computeOffset(refNode,refOffset){
+        var target=refNode,extraOffset=0;
+        if(target&&target.nodeType===1){
+            var childIdx=Math.min(refOffset,target.childNodes.length-1);
+            if(childIdx<0){target=refNode;}
+            else{
+                target=target.childNodes[childIdx];
+                while(target&&target.nodeType===1){ if(target.firstChild) target=target.firstChild; else break; }
+            }
+        }else if(target&&target.nodeType===3){extraOffset=refOffset;}
+        var w=document.createTreeWalker(container,NodeFilter.SHOW_TEXT);
+        var total=0,node;
+        while(node=w.nextNode()){
+            if(node===target) return total+extraOffset;
+            if(target&&target.nodeType===1&&target.contains&&target.contains(node)) return total;
+            total+=(node.textContent||'').length;
+        }
+        return total;
+    }
+    var startOffset=computeOffset(range.startContainer,range.startOffset);
+    var endOffset=computeOffset(range.endContainer,range.endOffset);
+    if(endOffset<=startOffset) endOffset=startOffset+selText.length;
+
+    // Surrounding plain-text context (120 chars each side).
+    var beforeCtx='',afterCtx='';
+    try{
+        var sn=range.startContainer,so=range.startOffset,before='';
+        if(sn.nodeType===3) before=sn.textContent.substring(Math.max(0,so-120),so);
+        if(before.length<60){
+            var prev=sn.previousSibling||(sn.parentNode?sn.parentNode.previousSibling:null);
+            for(var i=0;i<10&&prev&&before.length<120;i++){
+                before=(prev.textContent||'').slice(-120)+before;
+                prev=prev.previousSibling||(prev.parentNode?prev.parentNode.previousSibling:null);
+            }
+        }
+        beforeCtx=before.slice(-120);
+        var en=range.endContainer,eo=range.endOffset,after='';
+        if(en.nodeType===3) after=en.textContent.substring(eo,eo+120);
+        if(after.length<60){
+            var next=en.nextSibling||(en.parentNode?en.parentNode.nextSibling:null);
+            for(var j=0;j<10&&next&&after.length<120;j++){
+                after=after+(next.textContent||'').substring(0,120);
+                next=next.nextSibling||(next.parentNode?next.parentNode.nextSibling:null);
+            }
+        }
+        afterCtx=after.substring(0,120);
+    }catch(e){}
+
+    return JSON.stringify({selHtml:selHtml,selText:selText,before:beforeCtx,after:afterCtx,startOffset:startOffset,endOffset:endOffset});
+})();"""
+
+
+def _resolve_keyword(parent_text, sel_html, sel_text, before_ctx, after_ctx,
+                     start_offset, end_offset):
+    """Resolve the selection to the corresponding source region in parent_text,
+    expanding to complete \\(...\\) / \\[...\\] math blocks. Returns the keyword
+    string (may be empty).
+
+    Ported from ir_extract_cloze. Anchors on plain-text ASCII fragments plus
+    before/after context so the SELECTED occurrence is resolved even when the
+    same text recurs, then falls back to JS character offsets as a last resort.
+    """
+    import re as _re
+
+    def _strip(s):
+        return _re.sub(r'<[^>]+>', '', s or '')
+
+    plain_parent = _strip(parent_text)
+
+    if sel_html and sel_html in parent_text:
+        return sel_html
+    if sel_text and sel_text in plain_parent:
+        return sel_text
+    if sel_text and sel_text in parent_text:
+        return sel_text
+
+    # Selection likely contains rendered math (Unicode) while source has LaTeX.
+    # Anchor on ASCII fragments, then expand to whole math blocks.
+    has_rendered_math = any(ord(c) > 127 for c in sel_text)
+    frags = [w for w in sel_text.split() if all(ord(c) < 128 for c in w) and len(w) >= 2]
+    if frags:
+        first, last = frags[0], frags[-1]
+        start_pos = -1
+        search_from = 0
+        while True:
+            idx = parent_text.find(first, search_from)
+            if idx == -1:
+                break
+            chunk_before = _strip(parent_text[max(0, idx - 60):idx])
+            if before_ctx and before_ctx[-5:] in chunk_before:
+                start_pos = idx
+                break
+            if start_pos == -1:
+                start_pos = idx
+            search_from = idx + 1
+        if start_pos == -1:
+            start_pos = parent_text.find(first)
+        if start_pos < 0:
+            start_pos = 0
+        end_pos = parent_text.find(last, start_pos)
+        end_pos = end_pos + len(last) if end_pos >= 0 else start_pos + len(first)
+
+        # When the selection contained rendered math, the math block sits right
+        # before/after the ASCII anchors (it has no ASCII fragment of its own).
+        # Pull in an adjacent \(...\) / \[...\] block, skipping whitespace,
+        # punctuation and HTML tags between the anchor and the math.
+        if has_rendered_math:
+            after_text = parent_text[end_pos:]
+            skip = 0
+            while skip < len(after_text):
+                ch = after_text[skip]
+                if ch == "<":
+                    gt = after_text.find(">", skip)
+                    skip = gt + 1 if gt >= 0 else len(after_text)
+                elif ch == "&":
+                    semi = after_text.find(";", skip)
+                    skip = semi + 1 if (semi >= 0 and semi - skip < 10) else skip + 1
+                elif ch in " \t\n\r.,;:!?)":
+                    skip += 1
+                else:
+                    break
+            nearby = after_text[skip:skip + 2]
+            if nearby == "\\(" or nearby == "\\[":
+                delim = "\\)" if nearby == "\\(" else "\\]"
+                ci = after_text.find(delim, skip)
+                if ci >= 0:
+                    end_pos = end_pos + ci + 2
+
+        # Expand backwards: if start sits inside a math block, move to its opener.
+        before_region = parent_text[:start_pos]
+        if before_region.rfind("\\(") > before_region.rfind("\\)"):
+            start_pos = before_region.rfind("\\(")
+        if before_region.rfind("\\[") > before_region.rfind("\\]"):
+            start_pos = before_region.rfind("\\[")
+
+        # Expand forwards to close any math block left open within the region.
+        region = parent_text[start_pos:end_pos]
+        if region.count("\\(") - region.count("\\)") > 0:
+            ci = parent_text.find("\\)", end_pos)
+            if ci >= 0:
+                end_pos = ci + 2
+        region = parent_text[start_pos:end_pos]
+        if region.count("\\[") - region.count("\\]") > 0:
+            ci = parent_text.find("\\]", end_pos)
+            if ci >= 0:
+                end_pos = ci + 2
+        kw = parent_text[start_pos:end_pos].strip()
+        if kw:
+            return kw
+
+    # Last resort: character offsets from JS.
+    s = max(0, min(start_offset or 0, len(parent_text)))
+    e = max(s, min(end_offset or 0, len(parent_text)))
+    kw = parent_text[s:e].strip()
+    return kw or sel_html or sel_text
+
+
 def _cmd_extract():
     if mw.state != "review": return
-    # Get HTML of selection (preserves math, formatting, etc.)
-    # After cloning, replace rendered MathJax containers with original LaTeX
-    # so the child note stores renderable source, not opaque MathJax DOM.
-    js = r"""(function(){
-        var sel=window.getSelection();
-        if(!sel||sel.isCollapsed) return '';
-        var range=sel.getRangeAt(0);
-        var div=document.createElement('div');
-        div.appendChild(range.cloneContents());
-
-        // Build a map from rendered <mjx-container> → original LaTeX
-        // MathJax 3 stores items in MathJax.startup.document.math
-        var texMap=new Map();
-        try {
-            var mathDoc=MathJax.startup.document;
-            if(mathDoc && mathDoc.math){
-                for(var item of mathDoc.math){
-                    if(item.typesetRoot){
-                        var delim=item.display?['\\[','\\]']:['\\(','\\)'];
-                        texMap.set(item.typesetRoot, delim[0]+item.math+delim[1]);
-                    }
-                }
-            }
-        } catch(e){}
-
-        // Replace <mjx-container> in the clone with original LaTeX.
-        // The clone's mjx-containers don't have MathJax refs, so we match
-        // them to originals by position within the selection range.
-        var origContainers=[];
-        var walker=document.createTreeWalker(
-            range.commonAncestorContainer.nodeType===1?range.commonAncestorContainer:range.commonAncestorContainer.parentNode,
-            NodeFilter.SHOW_ELEMENT,
-            {acceptNode:function(n){return n.tagName==='MJX-CONTAINER'?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_SKIP;}}
-        );
-        var n;
-        while(n=walker.nextNode()){
-            if(range.intersectsNode(n)) origContainers.push(n);
-        }
-
-        var cloneContainers=div.querySelectorAll('mjx-container');
-        for(var i=0;i<cloneContainers.length;i++){
-            var tex=null;
-            if(i<origContainers.length) tex=texMap.get(origContainers[i]);
-            if(!tex){
-                // Fallback: extract from assistive MathML
-                var mml=cloneContainers[i].querySelector('mjx-assistive-mml math');
-                if(mml){
-                    var isBlock=mml.getAttribute('display')==='block'||
-                                cloneContainers[i].getAttribute('display')==='true';
-                    // Can't perfectly recover LaTeX from MathML, so use a
-                    // simplified text extraction as last resort
-                    tex=(isBlock?'\\[':'\\(')+mml.textContent.trim()+(isBlock?'\\]':'\\)');
-                }
-            }
-            if(tex){
-                cloneContainers[i].replaceWith(document.createTextNode(tex));
-            }
-        }
-
-        // Compute plain-text offset of selection start, same as cloze logic.
-        // Handles both text-node and element-node startContainer.
-        var container=document.getElementById('qa')||document.body;
-        function computeOffset(refNode, refOffset){
-            var target=refNode;
-            var extraOffset=0;
-            if(target && target.nodeType===1){
-                var childIdx=Math.min(refOffset, target.childNodes.length-1);
-                if(childIdx<0){
-                    target=refNode;
-                } else {
-                    target=target.childNodes[childIdx];
-                    while(target && target.nodeType===1){
-                        if(target.firstChild) target=target.firstChild;
-                        else break;
-                    }
-                }
-            } else if(target && target.nodeType===3){
-                extraOffset=refOffset;
-            }
-            var w=document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-            var total=0;
-            var n;
-            while(n=w.nextNode()){
-                if(n===target) return total + extraOffset;
-                if(target && target.nodeType===1 && target.contains && target.contains(n)){
-                    return total;
-                }
-                total += (n.textContent||'').length;
-            }
-            return total;
-        }
-        var startOffset=computeOffset(range.startContainer, range.startOffset);
-
-        // Capture surrounding plain-text context (120 chars each side)
-        var beforeCtx='', afterCtx='';
-        try {
-            var sn=range.startContainer, so=range.startOffset;
-            var before='';
-            if(sn.nodeType===3) before=sn.textContent.substring(Math.max(0,so-120),so);
-            if(before.length<60){
-                var prev=sn.previousSibling||sn.parentNode?.previousSibling;
-                for(var i=0;i<10&&prev&&before.length<120;i++){
-                    before=(prev.textContent||'').slice(-120)+before;
-                    prev=prev.previousSibling||prev.parentNode?.previousSibling;
-                }
-            }
-            beforeCtx=before.slice(-120);
-            var en=range.endContainer, eo=range.endOffset;
-            var after='';
-            if(en.nodeType===3) after=en.textContent.substring(eo,eo+120);
-            if(after.length<60){
-                var next=en.nextSibling||en.parentNode?.nextSibling;
-                for(var i=0;i<10&&next&&after.length<120;i++){
-                    after=after+(next.textContent||'').substring(0,120);
-                    next=next.nextSibling||next.parentNode?.nextSibling;
-                }
-            }
-            afterCtx=after.substring(0,120);
-        } catch(e){}
-
-        return JSON.stringify({selHtml: div.innerHTML, startOffset: startOffset,
-                               before: beforeCtx, after: afterCtx});
-    })();"""
-    mw.web.evalWithCallback(js, _do_extract)
+    mw.web.evalWithCallback(_CAPTURE_JS, _do_extract)
 
 def _do_extract(result):
     global _last_created_nid
@@ -1397,146 +1528,7 @@ def _replace_at_offset(text, needle, replacement, plain_offset):
 
 def _cmd_cloze():
     if mw.state != "review": return
-    # Get selection text, HTML, context, AND character offset within the card content.
-    # After cloning, replace rendered MathJax containers with original LaTeX
-    # so the child cloze note stores renderable source, not opaque MathJax DOM.
-    js = r"""(function(){
-        var sel=window.getSelection();
-        if(!sel||sel.isCollapsed)return JSON.stringify({err:1});
-        var range=sel.getRangeAt(0);
-        var div=document.createElement('div');
-        div.appendChild(range.cloneContents());
-
-        // Build a map from rendered <mjx-container> → original LaTeX
-        var texMap=new Map();
-        try {
-            var mathDoc=MathJax.startup.document;
-            if(mathDoc && mathDoc.math){
-                for(var item of mathDoc.math){
-                    if(item.typesetRoot){
-                        var delim=item.display?['\\[','\\]']:['\\(','\\)'];
-                        texMap.set(item.typesetRoot, delim[0]+item.math+delim[1]);
-                    }
-                }
-            }
-        } catch(e){}
-
-        // Match cloned mjx-containers to originals by position in selection
-        var origContainers=[];
-        var tw=document.createTreeWalker(
-            range.commonAncestorContainer.nodeType===1?range.commonAncestorContainer:range.commonAncestorContainer.parentNode,
-            NodeFilter.SHOW_ELEMENT,
-            {acceptNode:function(n){return n.tagName==='MJX-CONTAINER'?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_SKIP;}}
-        );
-        var n;
-        while(n=tw.nextNode()){
-            if(range.intersectsNode(n)) origContainers.push(n);
-        }
-        var cloneContainers=div.querySelectorAll('mjx-container');
-        for(var i=0;i<cloneContainers.length;i++){
-            var tex=null;
-            if(i<origContainers.length) tex=texMap.get(origContainers[i]);
-            if(!tex){
-                var mml=cloneContainers[i].querySelector('mjx-assistive-mml math');
-                if(mml){
-                    var isBlock=mml.getAttribute('display')==='block'||
-                                cloneContainers[i].getAttribute('display')==='true';
-                    tex=(isBlock?'\\[':'\\(')+mml.textContent.trim()+(isBlock?'\\]':'\\)');
-                }
-            }
-            if(tex){
-                cloneContainers[i].replaceWith(document.createTextNode(tex));
-            }
-        }
-
-        var selHtml=div.innerHTML;
-        var selText=sel.toString().trim();
-        
-        // Compute character offset of selection start within the rendered card text.
-        // This is crucial for finding the correct occurrence in the source.
-        // We handle BOTH text-node and element-node startContainer.
-        var container=document.getElementById('qa')||document.body;
-
-        function computeOffset(refNode, refOffset){
-            // If refNode is an element, resolve to the equivalent text position
-            // by descending into the refOffset-th child.
-            var target=refNode;
-            var extraOffset=0;
-            if(target && target.nodeType===1){
-                // Element node: refOffset is a child index. Walk to that child,
-                // then sum all text node lengths BEFORE it in the container.
-                var childIdx=Math.min(refOffset, target.childNodes.length-1);
-                if(childIdx<0){
-                    // Empty element — use the element itself as boundary
-                    target=refNode;
-                } else {
-                    target=target.childNodes[childIdx];
-                    // If that child is still an element, descend to its leftmost text descendant
-                    while(target && target.nodeType===1){
-                        if(target.firstChild) target=target.firstChild;
-                        else break;
-                    }
-                    extraOffset=0; // we're at the start of this text node
-                }
-            } else if(target && target.nodeType===3){
-                extraOffset=refOffset;
-            }
-            // Now walk text nodes in container up to target, accumulating length
-            var walker=document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-            var total=0;
-            var node;
-            while(node=walker.nextNode()){
-                if(node===target){
-                    return total + extraOffset;
-                }
-                // If target is an element we couldn't descend into, stop when we pass it
-                if(target && target.nodeType===1){
-                    // Check if target contains this text node — if yes, we've gone too far
-                    if(target.contains && target.contains(node)){
-                        return total; // approximate: position of element in text flow
-                    }
-                }
-                total += (node.textContent||'').length;
-            }
-            // Not found — return total (end of container)
-            return total;
-        }
-
-        var startOffset=computeOffset(range.startContainer, range.startOffset);
-        var endOffset=computeOffset(range.endContainer, range.endOffset);
-        if(endOffset<=startOffset) endOffset=startOffset+selText.length;
-        
-        // Get longer context (120 chars each side) for fallback matching
-        var beforeCtx='', afterCtx='';
-        try {
-            var sn=range.startContainer;
-            var so=range.startOffset;
-            var before='';
-            if(sn.nodeType===3) before=sn.textContent.substring(Math.max(0,so-120),so);
-            if(before.length<60){
-                var prev=sn.previousSibling||sn.parentNode?.previousSibling;
-                for(var i=0;i<10&&prev&&before.length<120;i++){
-                    before=(prev.textContent||'').slice(-120)+before;
-                    prev=prev.previousSibling||prev.parentNode?.previousSibling;
-                }
-            }
-            beforeCtx=before.slice(-120);
-            var en=range.endContainer;
-            var eo=range.endOffset;
-            var after='';
-            if(en.nodeType===3) after=en.textContent.substring(eo,eo+120);
-            if(after.length<60){
-                var next=en.nextSibling||en.parentNode?.nextSibling;
-                for(var i=0;i<10&&next&&after.length<120;i++){
-                    after=after+(next.textContent||'').substring(0,120);
-                    next=next.nextSibling||next.parentNode?.nextSibling;
-                }
-            }
-            afterCtx=after.substring(0,120);
-        } catch(e){}
-        return JSON.stringify({selHtml:selHtml,selText:selText,before:beforeCtx,after:afterCtx,startOffset:startOffset,endOffset:endOffset});
-    })();"""
-    mw.web.evalWithCallback(js, _do_cloze)
+    mw.web.evalWithCallback(_CAPTURE_JS, _do_cloze)
 
 def _do_cloze(result):
     global _last_created_nid
@@ -1568,157 +1560,15 @@ def _do_cloze(result):
     # to LaTeX, recover them from the parent note's Text field.
     sel_html = _strip_mathjax_html(sel_html, parent_text)
 
-    import re as _re
-    
-    # Strip HTML to get plain text for matching
-    plain_parent = _re.sub(r'<[^>]+>', '', parent_text)
-    
-    # Determine the keyword to use for the cloze
-    keyword = None
-    
-    if sel_html in parent_text:
-        keyword = sel_html
-    elif sel_text and sel_text in plain_parent:
-        keyword = sel_text
-    elif sel_text and sel_text in parent_text:
-        keyword = sel_text
-    else:
-        # Selection likely contains rendered math — the sel_text has Unicode symbols
-        # but the source has \(...\) LaTeX. We need to find the original source text.
-        #
-        # Strategy: split sel_text into plain-text fragments (non-math parts) and
-        # use them as anchors to find the region in the source text.
-        # Then expand to include any \(...\) or \[...\] blocks in between.
-        
-        # Extract plain text fragments from the selection (words that aren't math symbols)
-        plain_fragments = [w for w in sel_text.split() if all(ord(c) < 128 for c in w) and len(w) >= 2]
-        
-        if plain_fragments:
-            # Find the first fragment in the source to get approximate start
-            first_frag = plain_fragments[0]
-            last_frag = plain_fragments[-1] if len(plain_fragments) > 1 else first_frag
-            
-            # Use before_ctx to find the right occurrence of the first fragment
-            start_pos = -1
-            search_from = 0
-            while True:
-                idx = parent_text.find(first_frag, search_from)
-                if idx == -1: break
-                # Check if before_ctx matches
-                chunk_before = parent_text[max(0, idx-60):idx]
-                plain_chunk = _re.sub(r'<[^>]+>', '', chunk_before)
-                if before_ctx and before_ctx[-5:] in plain_chunk:
-                    start_pos = idx
-                    break
-                if start_pos == -1:
-                    start_pos = idx  # fallback to first occurrence
-                search_from = idx + 1
-            
-            if start_pos == -1:
-                start_pos = parent_text.find(first_frag)
-            
-            # Find the last fragment after start_pos to get approximate end
-            end_pos = parent_text.find(last_frag, start_pos)
-            if end_pos >= 0:
-                end_pos += len(last_frag)
-            else:
-                end_pos = start_pos + len(first_frag)
-            
-            # Now expand start_pos backwards and end_pos forwards to include
-            # any \(...\) or \[...\] math blocks that are part of the selection
-            
-            # Expand backwards: if there's a \( before start_pos with no matching \) between
-            before_text = parent_text[:start_pos]
-            last_open = before_text.rfind('\\(')
-            last_close = before_text.rfind('\\)')
-            if last_open > last_close and last_open >= 0:
-                start_pos = last_open
-            
-            # Expand forwards: check if there's a math block starting near end_pos
-            # (the selection included rendered math that follows the plain text)
-            # Skip whitespace, punctuation, AND HTML tags to find nearby math
-            after_text = parent_text[end_pos:]
-            skip = 0
-            while skip < len(after_text):
-                if after_text[skip] == '<':
-                    # Skip HTML tag
-                    close_tag = after_text.find('>', skip)
-                    if close_tag >= 0:
-                        skip = close_tag + 1
-                    else:
-                        break
-                elif after_text[skip] in ' \t\n\r.,;:!?)&':
-                    # Skip whitespace, punctuation, HTML entities start
-                    if after_text[skip] == '&':
-                        # Skip HTML entity like &nbsp;
-                        semi = after_text.find(';', skip)
-                        if semi >= 0 and semi - skip < 10:
-                            skip = semi + 1
-                        else:
-                            skip += 1
-                    else:
-                        skip += 1
-                else:
-                    break
-            nearby = after_text[skip:skip+10]
-            if nearby.startswith('\\(') or nearby.startswith('\\['):
-                delim = '\\)' if nearby.startswith('\\(') else '\\]'
-                close_idx = after_text.find(delim, skip)
-                if close_idx >= 0:
-                    end_pos = end_pos + close_idx + 2
-            
-            # Also expand backwards: check if there's a math block ending near start_pos
-            before_text_b = parent_text[:start_pos]
-            rskip = len(before_text_b) - 1
-            while rskip >= 0:
-                if before_text_b[rskip] == '>':
-                    open_tag = before_text_b.rfind('<', 0, rskip)
-                    if open_tag >= 0:
-                        rskip = open_tag - 1
-                    else:
-                        break
-                elif before_text_b[rskip] in ' \t\n\r.,;:!?(':
-                    rskip -= 1
-                else:
-                    break
-            # Check if text before start ends with \) or \]
-            if rskip >= 1:
-                two_chars = before_text_b[rskip-1:rskip+1]
-                if two_chars == '\\)' or two_chars == '\\]':
-                    delim = '\\(' if two_chars == '\\)' else '\\['
-                    open_idx = before_text_b.rfind(delim, 0, rskip)
-                    if open_idx >= 0:
-                        start_pos = open_idx
-            
-            # Also check for unmatched \( within the current region
-            region = parent_text[start_pos:end_pos]
-            open_count = region.count('\\(') - region.count('\\)')
-            if open_count > 0:
-                rest = parent_text[end_pos:]
-                close_idx = rest.find('\\)')
-                if close_idx >= 0:
-                    end_pos = end_pos + close_idx + 2
-            
-            # Same for \[...\]
-            region = parent_text[start_pos:end_pos]
-            open_d = region.count('\\[') - region.count('\\]')
-            if open_d > 0:
-                after_text = parent_text[end_pos:]
-                close_d = after_text.find('\\]')
-                if close_d >= 0:
-                    end_pos = end_pos + close_d + 2
-            
-            keyword = parent_text[start_pos:end_pos].strip()
-        
-        if not keyword:
-            # Last resort: use the character offsets
-            src_start = min(start_offset, len(parent_text))
-            src_end = min(end_offset, len(parent_text))
-            keyword = parent_text[src_start:src_end].strip()
-    
+    # Resolve the selection to the matching source region. Uses offset + context
+    # anchoring (ir_extract_cloze method) so the SELECTED occurrence is found
+    # even when the same text recurs in the note, and expands to whole math
+    # blocks when the selection contains rendered LaTeX.
+    keyword = _resolve_keyword(parent_text, sel_html, sel_text,
+                               before_ctx, after_ctx, start_offset, end_offset)
     if not keyword:
         keyword = sel_html or sel_text
-    
+
     cloze_marker = "{{c1::" + keyword + "}}"
     
     # Build cloze text: the FULL parent text with the keyword wrapped in cloze.
@@ -1811,7 +1661,7 @@ def _cmd_priority():
     result = ask_priority(m["p"], m["af"], m["iv"])
     if result is not None:
         m["p"]  = scheduler.clamp_priority(result)
-        m["af"] = scheduler.af_from_priority(m["p"])
+        m["af"] = _af_for_note(note, m["p"])
         save_meta(card.nid, m)
         _update_extract_priorities_proportionally(note, old_p, m["p"])
         tooltip(f"Priority: {m['p']:.1f}%, AF: {m['af']:.2f}")
@@ -1822,7 +1672,7 @@ def _cmd_quick_priority(delta):
     note = mw.col.get_note(card.nid); m = get(note)
     old_p = m["p"]
     m["p"]  = scheduler.clamp_priority(m["p"] + delta)
-    m["af"] = scheduler.af_from_priority(m["p"])
+    m["af"] = _af_for_note(note, m["p"])
     save_meta(card.nid, m)
     _update_extract_priorities_proportionally(note, old_p, m["p"])
     tooltip(f"Priority: {m['p']:.1f}%, AF: {m['af']:.2f}")
@@ -1844,14 +1694,28 @@ def _cmd_reschedule():
     if days < 1: return
     r = scheduler.reschedule_absolute(m["iv"], m["af"], m["rc"], days,
                                       cap=m.get("cap", 0))
+    old_p = m["p"]; old_iv = m["iv"]
     m["iv"]  = r["iv"]
     m["due"] = r["due"]
-    # af, rc, lr intentionally NOT touched
+    # af, rc, lr are NOT touched by the reschedule itself.
+    msg = f"Rescheduled: {r['iv']}d (no review)"
+    if not _is_source(note):
+        # SuperMemo: manually changing a topic's interval also changes its
+        # priority (shorter → higher priority, longer → lower). Sources are
+        # fixed-cadence by design and exempt. Priority then drives AF (extracts).
+        new_p = scheduler.couple_priority_to_interval(old_p, old_iv, r["iv"])
+        if abs(new_p - old_p) >= 0.05:
+            m["p"]  = new_p
+            m["af"] = _af_for_note(note, new_p)
+            arrow = "↑" if new_p < old_p else "↓"
+            msg = f"Rescheduled: {r['iv']}d  |  priority {old_p:.1f}% {arrow} {new_p:.1f}%"
     save_meta(card.nid, m)
-    _set_review(card, m["iv"], days)
+    if not _is_source(note):
+        _update_extract_priorities_proportionally(note, old_p, m["p"])
+    _set_review(card, m["iv"], m["iv"])
     try: _interleave_topic_queue.remove(card.id)
     except ValueError: pass
-    tooltip(f"Rescheduled: {r['iv']}d (no review)"); mw.reviewer.nextCard()
+    tooltip(msg); mw.reviewer.nextCard()
 
 def _cmd_execute_rep():
     """SM Ctrl+Shift+R: review the card and set new interval.
@@ -1868,6 +1732,20 @@ def _cmd_execute_rep():
     try: days = int(val)
     except ValueError: return
     if days < 1: return
+    if _is_source(note):
+        # Sources: the chosen interval becomes the fixed cadence (AF stays 1.0).
+        capped = scheduler.apply_cap(days, m.get("cap", 0))
+        m["iv"]  = capped
+        m["af"]  = 1.0
+        m["rc"]  = m["rc"] + 1
+        m["lr"]  = scheduler.today_str()
+        m["due"] = scheduler.date_from_days(capped)
+        save_meta(card.nid, m)
+        _set_review(card, m["iv"], capped)
+        try: _interleave_topic_queue.remove(card.id)
+        except ValueError: pass
+        tooltip(f"Source interval set: {capped}d"); mw.reviewer.nextCard()
+        return
     r = scheduler.execute_rep_manual(m["iv"], m["af"], m["rc"], days,
                                      cap=m.get("cap", 0))
     m["iv"]  = r["iv"]
@@ -1882,10 +1760,19 @@ def _cmd_execute_rep():
     tooltip(f"Execute rep: {r['iv']}d, AF={m['af']:.2f}"); mw.reviewer.nextCard()
 
 def _cmd_postpone():
-    """Postpone: multiply interval by 1.5x. Nudges AF up."""
+    """Postpone. Extracts: ×1.5 (nudges AF up). Sources: keep fixed cadence."""
     card = mw.reviewer.card
     if not card or not _is_topic_card_fresh(card): return
     note = mw.col.get_note(card.nid); m = get(note)
+    if _is_source(note):
+        # Fixed cadence: push to the next slot (today + iv). No AF/iv growth.
+        m["due"] = scheduler.date_from_days(m["iv"])
+        save_meta(card.nid, m)
+        _set_review(card, m["iv"], m["iv"])
+        try: _interleave_topic_queue.remove(card.id)
+        except ValueError: pass
+        tooltip(f"Postponed (source): {m['iv']}d"); mw.reviewer.nextCard()
+        return
     r = scheduler.postpone(m["iv"], m["af"], cap=m.get("cap", 0))
     m["iv"]  = r["iv"]
     m["af"]  = r["af"]
@@ -1921,10 +1808,16 @@ def _cmd_advance_today():
     note = mw.col.get_note(card.nid); m = get(note)
     m["due"] = scheduler.today_str()
     m["p"]   = scheduler.clamp_priority(max(0, m["p"] - 10))
-    m["af"]  = scheduler.af_from_priority(m["p"])
-    m["iv"]  = 1
-    save_meta(card.nid, m)
-    _set_review(card, 1, 0)
+    if _is_source(note):
+        # Sources: show today but keep the fixed interval and AF.
+        m["af"] = 1.0
+        save_meta(card.nid, m)
+        _set_review(card, max(1, m["iv"]), 0)
+    else:
+        m["af"]  = scheduler.af_from_priority(m["p"])
+        m["iv"]  = 1
+        save_meta(card.nid, m)
+        _set_review(card, 1, 0)
     if _interleave_active:
         card.due = _col_day() + 1
         mw.col.update_card(card)
@@ -2200,6 +2093,130 @@ def _import_markdown_source():
 
 
 # ============================================================
+# Sources in Progress — priority-ordered overview
+# ============================================================
+
+def _show_sources_view():
+    """Window listing all in-progress (not done) sources ordered by priority
+    (lowest score = highest priority = top). Lets you change the priority of
+    one or many at once; the change propagates proportionally to each source's
+    child extracts, exactly like the other priority controls."""
+    if not mw.col:
+        tooltip("No collection open."); return
+    from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+                        QTableWidget, QTableWidgetItem, QAbstractItemView,
+                        QHeaderView, Qt)
+    from .queue import _iter_topic_notes
+    import re as _re
+
+    source_tag = cfg("source_tag")
+
+    dlg = QDialog(mw)
+    dlg.setWindowTitle("IR — Sources in Progress")
+    dlg.setMinimumSize(760, 520)
+    layout = QVBoxLayout()
+    layout.addWidget(QLabel(
+        "In-progress sources, highest priority on top (lower score = higher "
+        "priority).\nSelect one or more rows and Set Priority — changes "
+        "propagate proportionally to child extracts."))
+
+    table = QTableWidget()
+    table.setColumnCount(4)
+    table.setHorizontalHeaderLabels(["Priority", "Interval", "Due", "Source"])
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.verticalHeader().setVisible(False)
+    table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+    layout.addWidget(table)
+
+    def _plain(html):
+        return _re.sub(r'<[^>]+>', '', html or '').replace("&nbsp;", " ").strip()
+
+    def load():
+        rows = []
+        for nid, note, m in _iter_topic_notes(cfg("topics_deck")):
+            if source_tag not in note.tags:
+                continue
+            if m["st"] != "active":
+                continue
+            fnames = [f["name"] for f in note.note_type()["flds"]]
+            title = ""
+            if "Reference" in fnames:
+                title = _plain(note["Reference"])
+            if not title and "Text" in fnames:
+                title = _plain(note["Text"])
+            if not title and note.fields:
+                title = _plain(note.fields[0])
+            rows.append((m["p"], m["iv"], m.get("due") or "-", title[:160], nid))
+        # Lowest priority score first = highest priority on top.
+        rows.sort(key=lambda r: (r[0], r[4]))
+        table.setRowCount(len(rows))
+        for i, (p, iv, due, title, nid) in enumerate(rows):
+            it_p = QTableWidgetItem(f"{p:.1f}")
+            it_p.setData(Qt.ItemDataRole.UserRole, nid)
+            it_p.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            it_iv = QTableWidgetItem(f"{iv}d")
+            it_iv.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            it_due = QTableWidgetItem(str(due))
+            it_due.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            table.setItem(i, 0, it_p)
+            table.setItem(i, 1, it_iv)
+            table.setItem(i, 2, it_due)
+            table.setItem(i, 3, QTableWidgetItem(title))
+        table.setColumnWidth(0, 70)
+        table.setColumnWidth(1, 70)
+        table.setColumnWidth(2, 110)
+        count_lbl.setText(f"{len(rows)} source(s) in progress")
+
+    def selected_nids():
+        nids = []
+        for idx in table.selectionModel().selectedRows():
+            it = table.item(idx.row(), 0)
+            if it is not None:
+                nids.append(it.data(Qt.ItemDataRole.UserRole))
+        return nids
+
+    def set_priority():
+        nids = selected_nids()
+        if not nids:
+            tooltip("Select one or more sources first."); return
+        first = mw.col.get_note(nids[0]); fm = get(first)
+        result = ask_priority(fm["p"], fm["af"], fm["iv"])
+        if result is None:
+            return
+        for nid in nids:
+            note = mw.col.get_note(nid); m = get(note)
+            old_p = m["p"]
+            m["p"]  = scheduler.clamp_priority(result)
+            m["af"] = _af_for_note(note, m["p"])
+            save_meta(nid, m)
+            _update_extract_priorities_proportionally(note, old_p, m["p"])
+        tooltip(f"Priority set to {result:.1f}% on {len(nids)} source(s).")
+        load()
+
+    count_lbl = QLabel("")
+    btn_row = QHBoxLayout()
+    set_btn = QPushButton("Set Priority…")
+    refresh_btn = QPushButton("Refresh")
+    close_btn = QPushButton("Close")
+    set_btn.clicked.connect(set_priority)
+    refresh_btn.clicked.connect(load)
+    close_btn.clicked.connect(dlg.accept)
+    btn_row.addWidget(count_lbl)
+    btn_row.addStretch()
+    btn_row.addWidget(set_btn)
+    btn_row.addWidget(refresh_btn)
+    btn_row.addWidget(close_btn)
+    layout.addLayout(btn_row)
+
+    table.doubleClicked.connect(lambda *_: set_priority())
+    dlg.setLayout(layout)
+    load()
+    dlg.exec()
+
+
+# ============================================================
 # Menu
 # ============================================================
 
@@ -2214,13 +2231,14 @@ def _add_menu():
     _a("IR Settings", show_settings)
     menu.addSeparator()
     _a("Prepare Topics", _prepare_topics, cfg("key_prepare"))
+    _a("Sources in Progress", _show_sources_view)
     _a("Mercy (Spread Overdue)", lambda: showInfo(f"Mercy: {mercy(cfg('topics_deck'), cfg('mercy_days'))} topics spread."))
     _a("Auto-Postpone Now", lambda: showInfo(f"Postponed {auto_postpone(cfg('topics_deck'), cfg('postpone_protection'))} topics."))
     _a("Clean Orphans", lambda: showInfo(f"Cleaned {clean_orphans(cfg('topics_deck'))} orphans."))
     menu.addSeparator()
     _a("Queue Stats", _show_stats)
     menu.addSeparator()
-    _a("Sync from Zotero", _zotero_sync)
+    _a("Sync from Zotero", _zotero_sync, cfg("key_zotero_sync"))
     _a("Import Markdown as Source", _import_markdown_source)
 
 
@@ -2236,9 +2254,10 @@ def _init_topics():
         note = card.note()
         if not has_field(note): continue
         if is_topic(note): continue
-        init_source(note, cfg("default_priority"), cap=_default_cap_for_note(note))
+        init_source(note, cfg("default_priority"), cap=_default_cap_for_note(note),
+                    interval=int(cfg("source_default_interval") or 3))
         mw.col.update_note(note)
-        _set_review(card, 1, 1)
+        _set_review(card, max(1, get(note)["iv"]), max(1, get(note)["iv"]))
         n += 1
     showInfo(f"Initialized {n} topics.")
 
@@ -2247,7 +2266,7 @@ def _show_stats():
     if not mw.col: return
     from aqt.qt import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                          QListWidget, QListWidgetItem, QPushButton, Qt)
-    from .queue import _iter_topic_notes, build_queue
+    from .queue import _iter_topic_notes, build_queue, priority_protection
 
     today = date.today().isoformat()
     total = due = active = done = forgotten = 0
@@ -2264,6 +2283,10 @@ def _show_stats():
         avg_af /= active; avg_iv /= active; avg_p /= active
 
     queue = build_queue(cfg("topics_deck"), cfg("randomization_degree"))
+
+    # SuperMemo "Priority protection": how deep into your top-priority topics
+    # you've actually reached today.
+    pp = priority_protection(cfg("topics_deck"))
 
     # Also count items due
     items_deck = cfg("items_deck")
@@ -2295,6 +2318,25 @@ def _show_stats():
     )
     lbl = QLabel(stats); lbl.setWordWrap(True)
     layout.addWidget(lbl)
+
+    # Priority protection (SuperMemo): the priority % of the most important topic
+    # still outstanding today. Lower number = less of your top material protected.
+    if pp["fully_protected"]:
+        pp_text = ("Priority protection: 100%  —  all due topics reviewed; "
+                   "your full collection is protected today.")
+    else:
+        pp_text = (
+            f"Priority protection: {pp['cutoff']:.1f}%  —  topics in the "
+            f"{pp['cutoff']:.1f}%–100% priority range are at risk today "
+            f"({pp['outstanding']} outstanding: {pp['outstanding_sources']} source(s) / "
+            f"{pp['outstanding_extracts']} extract(s); {pp['reviewed_today']} reviewed today).\n"
+            f"Only topics more important than {pp['cutoff']:.1f}% are guaranteed a "
+            f"timely review. Raise it by doing more reviews, importing less, or "
+            f"deprioritising honestly."
+        )
+    pp_lbl = QLabel(pp_text); pp_lbl.setWordWrap(True)
+    pp_lbl.setStyleSheet("QLabel { padding: 4px; }")
+    layout.addWidget(pp_lbl)
 
     # Queue list
     layout.addWidget(QLabel(f"Today's queue ({len(queue)} topics, sorted by priority):"))
@@ -2449,7 +2491,7 @@ def _browser_set_priority(browser):
         m = get(note)
         old_p = m["p"]
         m["p"]  = scheduler.clamp_priority(result)
-        m["af"] = scheduler.af_from_priority(m["p"])
+        m["af"] = _af_for_note(note, m["p"])
         save_meta(nid, m)
         _update_extract_priorities_proportionally(note, old_p, m["p"])
     tooltip(f"Priority set to {result:.1f}% on {len(topics)} topic(s).")
@@ -2462,11 +2504,17 @@ def _browser_advance_today(browser):
         m = get(note)
         m["due"] = scheduler.today_str()
         m["p"]   = scheduler.clamp_priority(max(0, m["p"] - 10))
-        m["af"]  = scheduler.af_from_priority(m["p"])
-        m["iv"]  = 1
-        save_meta(nid, m)
-        cards = note.cards()
-        if cards: _set_review(cards[0], 1, 0)
+        if _is_source(note):
+            m["af"] = 1.0  # keep fixed cadence + interval
+            save_meta(nid, m)
+            cards = note.cards()
+            if cards: _set_review(cards[0], max(1, m["iv"]), 0)
+        else:
+            m["af"]  = scheduler.af_from_priority(m["p"])
+            m["iv"]  = 1
+            save_meta(nid, m)
+            cards = note.cards()
+            if cards: _set_review(cards[0], 1, 0)
     tooltip(f"Advanced {len(topics)} topic(s) to today.")
 
 
@@ -2495,12 +2543,21 @@ def _browser_reschedule(browser):
         m = get(note)
         r = scheduler.reschedule_absolute(m["iv"], m["af"], m["rc"], days,
                                           cap=m.get("cap", 0))
+        old_p = m["p"]; old_iv = m["iv"]
         m["iv"]  = r["iv"]
         m["due"] = r["due"]
-        # af, rc, lr unchanged
+        # af, rc, lr unchanged. SuperMemo couples manual interval changes to
+        # priority for topics (extracts); sources are fixed-cadence and exempt.
+        if not _is_source(note):
+            new_p = scheduler.couple_priority_to_interval(old_p, old_iv, r["iv"])
+            if abs(new_p - old_p) >= 0.05:
+                m["p"]  = new_p
+                m["af"] = _af_for_note(note, new_p)
         save_meta(nid, m)
+        if not _is_source(note):
+            _update_extract_priorities_proportionally(note, old_p, m["p"])
         cards = note.cards()
-        if cards: _set_review(cards[0], m["iv"], days)
+        if cards: _set_review(cards[0], m["iv"], m["iv"])
     tooltip(f"Rescheduled {len(topics)} topic(s) → {days}d.")
 
 
@@ -2509,13 +2566,20 @@ def _browser_postpone(browser):
     if not topics: tooltip("No IR topics selected."); return
     for nid, note in topics:
         m = get(note)
-        r = scheduler.postpone(m["iv"], m["af"], cap=m.get("cap", 0))
-        m["iv"]  = r["iv"]
-        m["af"]  = r["af"]
-        m["due"] = r["due"]
-        save_meta(nid, m)
-        cards = note.cards()
-        if cards: _set_review(cards[0], r["iv"], r["iv"])
+        if _is_source(note):
+            # Fixed cadence: re-due in iv days, no AF/iv growth.
+            m["due"] = scheduler.date_from_days(m["iv"])
+            save_meta(nid, m)
+            cards = note.cards()
+            if cards: _set_review(cards[0], m["iv"], m["iv"])
+        else:
+            r = scheduler.postpone(m["iv"], m["af"], cap=m.get("cap", 0))
+            m["iv"]  = r["iv"]
+            m["af"]  = r["af"]
+            m["due"] = r["due"]
+            save_meta(nid, m)
+            cards = note.cards()
+            if cards: _set_review(cards[0], r["iv"], r["iv"])
     tooltip(f"Postponed {len(topics)} topic(s).")
 
 

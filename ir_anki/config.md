@@ -13,6 +13,15 @@
 - `default_priority`: Default priority 0-100 (0=highest). Default: `50`
 - `randomization_degree`: Queue randomization 0-100. Default: `5`
 - `topic_ratio`: % of topics in combined review. Default: `20`
+- `source_default_interval`: Fixed cadence for sources, in days. Each source is presented every N days; its interval only changes when you reschedule it. Default: `3`
+- `source_cap_default`: Max interval (days) for sources, `0` = none. Default: `0`
+- `extract_cap_default`: Max interval (days) for extracts, `0` = none. Default: `0`
+
+Sources use a **fixed cadence**: the A-Factor is pinned to 1.0 so the interval never grows on its own (auto-postpone and postpone keep the same rhythm). Setting a new interval via Reschedule or Execute Repetition makes that the source's interval going forward. Extracts keep the priority-driven growing-interval behaviour.
+
+**Interval ↔ priority coupling (extracts):** like SuperMemo, manually changing an extract's interval also changes its priority — shortening the interval raises priority (lowers the %), delaying it lowers priority (raises the %). The percent scales with the interval ratio (e.g. halving the interval roughly halves the %). Sources are fixed-cadence and exempt. The change also propagates proportionally to child extracts, like any other priority change.
+
+**Priority protection (Queue Stats):** SuperMemo's overload feedback metric. It shows the priority % of the most important topic still outstanding today — i.e. only topics more important than that cutoff are guaranteed a timely review; everything from the cutoff to 100% is at risk. 100% means all due topics are done. Raise it by reviewing more, importing less, or deprioritising honestly. (Topics only; items are FSRS-scheduled.)
 
 **Overload management:**
 - `auto_postpone`: Auto-postpone overdue low-priority topics. Default: `true`
@@ -37,6 +46,17 @@
 - `key_edit_last`: Edit last created card → `Shift+e`
 - `key_undo_text`: Undo last extract/cloze highlight → `Alt+z`
 - `key_undo_answer`: Undo last topic answer (restore to queue) → `Ctrl+Shift+z`
+- `key_prepare`: Prepare topics → `Ctrl+Shift+p`
+- `key_zotero_sync`: Sync from Zotero → `Ctrl+Shift+y`
+
+**Zotero:**
+- `zotero_library_id`: Your Zotero user/library ID.
+- `zotero_api_key`: Zotero API key.
+- `zotero_import_tag`: Tag that marks items to import as sources. Default: `IR`
+- `zotero_highlight_color`: Highlight color imported as extracts. Default: `#ffd400`
+
+**Menu → IR:**
+- `Sources in Progress`: window listing all not-done sources ordered by priority (highest on top); change priority of one or many at once, propagated proportionally to child extracts.
 
 **Recommended Main deck settings:**
 - New cards/day: 9999 (let sub-decks control)

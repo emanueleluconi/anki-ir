@@ -14,7 +14,8 @@ def show_settings():
         "initial_interval": 1, "default_priority": 50, "randomization_degree": 5,
         "auto_postpone": True, "postpone_protection": 10, "mercy_days": 14,
         "topic_item_ratio": 5,
-        "source_cap_default": 14, "extract_cap_default": 0,
+        "source_cap_default": 0, "extract_cap_default": 0,
+        "source_default_interval": 3,
         "source_tag": "ir::source", "extract_tag": "ir::extract",
         "highlight_extract": "#5b9bd5", "highlight_cloze": "#c9a227",
         "key_extract": "x", "key_cloze": "z", "key_priority": "Shift+p",
@@ -23,9 +24,9 @@ def show_settings():
         "key_postpone": "Shift+w", "key_done": "Shift+d", "key_forget": "Shift+f",
         "key_later_today": "Shift+l", "key_advance_today": "Shift+a",
         "key_edit_last": "Shift+e", "key_undo_text": "Alt+z",
-        "key_prepare": "Ctrl+Shift+p",
+        "key_prepare": "Ctrl+Shift+p", "key_zotero_sync": "Ctrl+Shift+y",
         "zotero_library_id": "", "zotero_api_key": "",
-        "zotero_import_tag": "imported", "zotero_highlight_color": "#ffd400",
+        "zotero_import_tag": "IR", "zotero_highlight_color": "#ffd400",
     }
     for k, v in defaults.items():
         if k not in conf: conf[k] = v
@@ -77,6 +78,7 @@ def show_settings():
         ("default_priority", "Default priority (0-100)", "int"),
         ("randomization_degree", "Randomization (0-100)", "int"),
         ("topic_item_ratio", "Items per topic (interleave ratio)", "int"),
+        ("source_default_interval", "Source interval (days, fixed cadence)", "int"),
         ("source_cap_default", "Source default interval cap (days, 0=none)", "int"),
         ("extract_cap_default", "Extract default interval cap (days, 0=none)", "int"),
     ])
@@ -105,6 +107,7 @@ def show_settings():
         ("key_edit_last", "Edit last created", "str"),
         ("key_undo_text", "Undo text change", "str"),
         ("key_prepare", "Prepare topics", "str"),
+        ("key_zotero_sync", "Sync from Zotero", "str"),
     ])
     add_group("Highlight Colors", [
         ("highlight_extract", "Extract highlight", "str"),

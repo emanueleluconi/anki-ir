@@ -8,6 +8,11 @@ from . import scheduler
 from .ir_meta import get, is_topic, save_meta
 
 
+def _cfg(key, default=None):
+    c = mw.addonManager.getConfig("ir_anki") or {}
+    return c.get(key, default)
+
+
 def _iter_topic_notes(deck_name):
     """Yield (nid, note, meta) for all topic notes in deck. Deduplicates by nid."""
     if not mw.col:
@@ -77,14 +82,20 @@ def auto_postpone(deck_name, protection_pct=10):
 
     overdue.sort(key=lambda x: x[0])  # best priority first
     prot = math.ceil(len(overdue) * (protection_pct / 100.0))
+    source_tag = _cfg("source_tag", "ir::source")
     n = 0
     for _, nid in overdue[prot:]:
         note = mw.col.get_note(nid)
         m = get(note)
-        r = scheduler.postpone(m["iv"], m["af"], cap=m.get("cap", 0))
-        m["iv"]  = r["iv"]
-        m["af"]  = r["af"]
-        m["due"] = r["due"]
+        if source_tag in note.tags:
+            # Sources keep a fixed cadence: push to the next slot (today + iv).
+            # Interval and AF are left untouched so the user-set rhythm holds.
+            m["due"] = scheduler.date_from_days(m["iv"])
+        else:
+            r = scheduler.postpone(m["iv"], m["af"], cap=m.get("cap", 0))
+            m["iv"]  = r["iv"]
+            m["af"]  = r["af"]
+            m["due"] = r["due"]
         save_meta(nid, m)
         n += 1
     return n
@@ -121,6 +132,57 @@ def mercy(deck_name, mercy_days=14):
         save_meta(nid, m)
         n += 1
     return n
+
+
+def priority_protection(deck_name):
+    """SuperMemo 'Priority protection' for topics.
+
+    Definition (Help: Toolkit : Statistics : Analysis : Use : Priority protection):
+    "the highest priority item (with the lowest %) that was missed in repetitions"
+    on a given day — i.e. your actual processing capacity for high-priority
+    material. "If your graph oscillates around priority of 3%, only the top 3% of
+    your learning material is guaranteed a timely repetition."
+
+    We compute it for topics as the priority percent of the most important
+    (lowest %) topic that is still outstanding (scheduled on/before today and not
+    yet reviewed today). Everything more important than this cutoff has been
+    protected; everything in [cutoff, 100%] is at risk. If nothing is outstanding,
+    protection is full (cutoff = 100.0, fully_protected = True).
+
+    Items are excluded — they are scheduled by Anki/FSRS, not by IR priority.
+    """
+    today = date.today().isoformat()
+    src_tag = _cfg("source_tag", "ir::source")
+    ext_tag = _cfg("extract_tag", "ir::extract")
+    outstanding = []          # priorities of due-but-unreviewed active topics
+    reviewed_today = 0
+    out_sources = out_extracts = 0
+    for _, note, m in _iter_topic_notes(deck_name):
+        if m["st"] != "active":
+            continue
+        due = m.get("due")
+        if due and due <= today:
+            outstanding.append(m["p"])
+            if src_tag in note.tags:
+                out_sources += 1
+            elif ext_tag in note.tags:
+                out_extracts += 1
+        elif m.get("lr") == today:
+            reviewed_today += 1
+    if outstanding:
+        cutoff = min(outstanding)
+        fully_protected = False
+    else:
+        cutoff = 100.0
+        fully_protected = True
+    return {
+        "cutoff": cutoff,
+        "fully_protected": fully_protected,
+        "outstanding": len(outstanding),
+        "outstanding_sources": out_sources,
+        "outstanding_extracts": out_extracts,
+        "reviewed_today": reviewed_today,
+    }
 
 
 def clean_orphans(deck_name):

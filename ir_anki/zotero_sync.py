@@ -34,7 +34,7 @@ def _cfg(key):
         "source_tag": "ir::source", "extract_tag": "ir::extract",
         "default_priority": 50,
         "zotero_library_id": "", "zotero_api_key": "",
-        "zotero_import_tag": "imported", "zotero_highlight_color": "#ffd400",
+        "zotero_import_tag": "IR", "zotero_highlight_color": "#ffd400",
     }.get(key))
 
 
@@ -502,7 +502,7 @@ def sync():
     for it in items:
         _cache[it["key"]] = it
 
-    import_tag = (_cfg("zotero_import_tag") or "imported").lower()
+    import_tag = (_cfg("zotero_import_tag") or "IR").lower()
     hl_color = (_cfg("zotero_highlight_color") or "#ffd400").lower()
     src_tag = _cfg("source_tag") or "ir::source"
     ext_tag = _cfg("extract_tag") or "ir::extract"

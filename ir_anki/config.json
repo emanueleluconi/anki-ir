@@ -10,8 +10,9 @@
     "postpone_protection": 30,
     "mercy_days": 14,
     "topic_item_ratio": 5,
-    "source_cap_default": 14,
+    "source_cap_default": 0,
     "extract_cap_default": 0,
+    "source_default_interval": 3,
     "source_tag": "ir::source",
     "extract_tag": "ir::extract",
     "highlight_extract": "#5b9bd5",
@@ -32,8 +33,9 @@
     "key_undo_text": "Alt+z",
     "key_undo_answer": "Ctrl+Shift+z",
     "key_prepare": "Ctrl+Shift+p",
+    "key_zotero_sync": "Ctrl+Shift+y",
     "zotero_library_id": "7676928",
     "zotero_api_key": "eRnKGwH1h49IoAncMUA5HQsR",
-    "zotero_import_tag": "imported",
+    "zotero_import_tag": "IR",
     "zotero_highlight_color": "#ffd400"
 }
