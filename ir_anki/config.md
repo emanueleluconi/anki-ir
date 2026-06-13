@@ -14,6 +14,7 @@
 - `randomization_degree`: Queue randomization 0-100. Default: `5`
 - `topic_ratio`: % of topics in combined review. Default: `20`
 - `source_default_interval`: Fixed cadence for sources, in days. Each source is presented every N days; its interval only changes when you reschedule it. Default: `3`
+- `extract_priority_offset`: New extracts get their parent source's priority minus this many points (so extracts surface a little before the source). Default: `2`
 - `source_cap_default`: Max interval (days) for sources, `0` = none. Default: `0`
 - `extract_cap_default`: Max interval (days) for extracts, `0` = none. Default: `0`
 

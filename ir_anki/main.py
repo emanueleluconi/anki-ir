@@ -42,6 +42,7 @@ def cfg(key):
         "source_cap_default": 0,    # sources: fixed cadence, no cap by default
         "extract_cap_default": 0,   # extracts: no cap by default
         "source_default_interval": 3,  # sources: presented every N days by default
+        "extract_priority_offset": 2,  # extracts get parent priority − this (more important)
         "source_tag": "ir::source", "extract_tag": "ir::extract",
         "highlight_extract": "#5b9bd5", "highlight_cloze": "#c9a227",
         "key_extract": "x", "key_cloze": "z", "key_priority": "Shift+p",
@@ -63,6 +64,14 @@ def _is_source(note) -> bool:
         return cfg("source_tag") in note.tags
     except Exception:
         return False
+
+
+def _extract_offset() -> float:
+    """How many priority points an extract sits above its parent source."""
+    try:
+        return float(cfg("extract_priority_offset"))
+    except (TypeError, ValueError):
+        return 2.0
 
 
 def _af_for_note(note, p: float) -> float:
@@ -156,9 +165,9 @@ def _update_extract_priorities_proportionally(source_note, old_p: float, new_p: 
         if m.get("pnid", 0) != source_nid:
             continue
         # Scale the extract's priority by the same ratio as the parent,
-        # then enforce the "extract ≤ parent - 5" invariant.
+        # then enforce the "extract ≤ parent - offset" invariant.
         scaled = m["p"] * ratio
-        capped = min(scaled, new_p - 5.0)
+        capped = min(scaled, new_p - _extract_offset())
         new_extract_p = scheduler.clamp_priority(capped)
         m["p"]  = new_extract_p
         m["af"] = scheduler.af_from_priority(new_extract_p)
@@ -203,9 +212,41 @@ def _ask_new_source_priority(sources):
         title = note.fields[0][:80] if note.fields else "?"
         items.append({"card": card, "note": note, "title": title, "p": default_p, "today": False})
 
+    # Existing active source priorities (sorted) — used to show, live, where each
+    # newly assigned priority would land in the source priority queue.
+    import bisect
+    _src_tag = cfg("source_tag")
+    _new_nids = {note.id for _, note in sources}
+    existing_p = []
+    try:
+        _deck = cfg("topics_deck")
+        _seen = set()
+        for _cid in mw.col.find_cards(f'"deck:{_deck}"'):
+            _c = mw.col.get_card(_cid)
+            if _c.nid in _seen:
+                continue
+            _seen.add(_c.nid)
+            if _c.nid in _new_nids:
+                continue
+            _n = mw.col.get_note(_c.nid)
+            if not is_topic(_n) or _src_tag not in _n.tags:
+                continue
+            _m = get(_n)
+            if _m["st"] != "active":
+                continue
+            existing_p.append(_m["p"])
+        existing_p.sort()
+    except Exception:
+        existing_p = []
+
+    def _rank(p):
+        """1-based position among sources (1 = highest priority), and total."""
+        pos = bisect.bisect_left(existing_p, p) + 1
+        return pos, len(existing_p) + 1
+
     dlg = QDialog(mw)
     dlg.setWindowTitle(f"New Sources ({len(items)})")
-    dlg.setMinimumWidth(560)
+    dlg.setMinimumWidth(640)
     dlg.setMinimumHeight(min(500, 160 + len(items) * 45))
     main_layout = QVBoxLayout()
     main_layout.addWidget(QLabel(f"{len(items)} new source(s). Set priority per source:"))
@@ -214,14 +255,26 @@ def _ask_new_source_priority(sources):
     scroll = QScrollArea(); scroll.setWidgetResizable(True)
     container = QWidget(); grid = QGridLayout()
     grid.setColumnStretch(0, 3); grid.setColumnStretch(1, 2)
-    grid.setColumnStretch(2, 0); grid.setColumnStretch(3, 0)
+    grid.setColumnStretch(2, 0); grid.setColumnStretch(3, 0); grid.setColumnStretch(4, 0)
     grid.addWidget(QLabel("Source"), 0, 0)
     grid.addWidget(QLabel("Priority"), 0, 1)
     grid.addWidget(QLabel(""), 0, 2)
-    grid.addWidget(QLabel("Today"), 0, 3)
+    pos_hdr = QLabel("Position")
+    pos_hdr.setToolTip("Where this priority would rank among your existing sources (1 = highest priority).")
+    grid.addWidget(pos_hdr, 0, 3)
+    grid.addWidget(QLabel("Today"), 0, 4)
 
-    sliders = []; inputs = []; today_cbs = []
+    sliders = []; inputs = []; today_cbs = []; pos_labels = []
     focused_idx = [0]  # track which input is focused
+
+    def _update_pos(idx):
+        try:
+            p = float(inputs[idx].text())
+        except Exception:
+            p = sliders[idx].value()
+        p = max(0.0, min(100.0, p))
+        pos, total = _rank(p)
+        pos_labels[idx].setText(f"#{pos} / {total}")
 
     for i, item in enumerate(items):
         row = i + 1
@@ -235,18 +288,22 @@ def _ask_new_source_priority(sources):
         inp = QLineEdit(str(default_p)); inp.setFixedWidth(55)
         grid.addWidget(inp, row, 2); inputs.append(inp)
 
-        cb = QCheckBox(); grid.addWidget(cb, row, 3); today_cbs.append(cb)
+        pos_lbl = QLabel("—"); pos_lbl.setStyleSheet("color: #888;")
+        grid.addWidget(pos_lbl, row, 3); pos_labels.append(pos_lbl)
+
+        cb = QCheckBox(); grid.addWidget(cb, row, 4); today_cbs.append(cb)
 
         # Sync slider → input (use default args to capture correctly)
-        def _on_sl(val, _inp=inp): _inp.setText(str(val))
+        def _on_sl(val, _inp=inp, _i=i): _inp.setText(str(val)); _update_pos(_i)
         sl.valueChanged.connect(_on_sl)
 
         # Sync input → slider
-        def _on_inp(_t=None, _sl=sl, _inp=inp):
+        def _on_inp(_t=None, _sl=sl, _inp=inp, _i=i):
             try:
                 v = int(float(_inp.text()))
                 _sl.blockSignals(True); _sl.setValue(max(0, min(100, v))); _sl.blockSignals(False)
             except: pass
+            _update_pos(_i)
         inp.textChanged.connect(_on_inp)
 
         # Track focus — use a wrapper function, not lambda with tuple return
@@ -267,6 +324,8 @@ def _ask_new_source_priority(sources):
 
     container.setLayout(grid); scroll.setWidget(container)
     main_layout.addWidget(scroll)
+    for _i in range(len(items)):
+        _update_pos(_i)
 
     # Preset buttons — apply to the FOCUSED source
     preset_row = QHBoxLayout()
@@ -415,7 +474,8 @@ def _prepare_topics():
                 ref = note["Reference"].strip()
                 if ref and ref in ref_to_priority:
                     parent_p = ref_to_priority[ref]
-            init_extract(note, 0, parent_p, cap=_default_cap_for_note(note))
+            init_extract(note, 0, parent_p, cap=_default_cap_for_note(note),
+                         offset=_extract_offset())
             mw.col.update_note(note)
             _set_review(card, 1, 1)
             init_count += 1
@@ -459,7 +519,7 @@ def _prepare_topics():
                 ref = note["Reference"].strip()
                 if ref not in new_source_ref_to_priority: continue
                 parent_p = new_source_ref_to_priority[ref]
-                correct_extract_p = scheduler.clamp_priority(parent_p - 5.0)
+                correct_extract_p = scheduler.clamp_priority(parent_p - _extract_offset())
                 if abs(m["p"] - correct_extract_p) < 0.01: continue
                 fm = get(mw.col.get_note(card.nid))
                 fm["p"]  = correct_extract_p
@@ -1220,8 +1280,8 @@ def _do_extract(result):
 
     did = mw.col.decks.id_for_name(cfg("topics_deck")) or card.did
     pp = pm["p"] if pm else cfg("default_priority")
-    # Extract priority = parent priority - 5 (so extracts appear before parent)
-    init_extract(nn, parent.id, pp, cap=_default_cap_for_note(nn))
+    # Extract priority = parent priority − extract_priority_offset (extracts surface first)
+    init_extract(nn, parent.id, pp, cap=_default_cap_for_note(nn), offset=_extract_offset())
     nn.note_type()["did"] = did
     mw.col.addNote(nn)
     _last_created_nid = nn.id
@@ -2010,6 +2070,16 @@ def _zotero_sync():
         tooltip(f"Zotero error: {ex}")
         import traceback; traceback.print_exc()
 
+def _zotero_full_resync():
+    try:
+        from .zotero_sync import full_resync
+        tooltip("Zotero: Full re-scan…")
+        s, e = full_resync()
+        tooltip(f"Zotero (full): {s} sources, {e} extracts created.")
+    except Exception as ex:
+        tooltip(f"Zotero error: {ex}")
+        import traceback; traceback.print_exc()
+
 def _zotero_reset():
     from .zotero_sync import reset_state
     reset_state()
@@ -2239,6 +2309,7 @@ def _add_menu():
     _a("Queue Stats", _show_stats)
     menu.addSeparator()
     _a("Sync from Zotero", _zotero_sync, cfg("key_zotero_sync"))
+    _a("Full Re-scan from Zotero", _zotero_full_resync)
     _a("Import Markdown as Source", _import_markdown_source)
 
 

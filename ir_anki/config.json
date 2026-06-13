@@ -13,6 +13,7 @@
     "source_cap_default": 0,
     "extract_cap_default": 0,
     "source_default_interval": 3,
+    "extract_priority_offset": 2,
     "source_tag": "ir::source",
     "extract_tag": "ir::extract",
     "highlight_extract": "#5b9bd5",

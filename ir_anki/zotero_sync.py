@@ -15,9 +15,9 @@ Cards are created directly — no Prepare Topics needed after sync.
 import json
 import os
 import re
-from urllib.request import Request, urlopen
-from urllib.error import URLError
-from urllib.parse import quote
+import http.client
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from anki.notes import Note
 from aqt import mw
@@ -40,24 +40,65 @@ def _cfg(key):
 
 
 # ============================================================
-# Zotero API
+# Zotero API  (keep-alive, thread-local connection per worker)
 # ============================================================
 
 _cache = {}
+_tls = threading.local()
+_ZHOST = "api.zotero.org"
 
 
-def _api(endpoint):
+def _conn():
+    c = getattr(_tls, "conn", None)
+    if c is None:
+        c = http.client.HTTPSConnection(_ZHOST, timeout=30)
+        _tls.conn = c
+    return c
+
+
+def _api(endpoint, _retry=True):
+    """GET /users/{lib}/{endpoint}, reusing a keep-alive HTTPS connection.
+
+    Reusing the connection avoids a TLS handshake per request, which is a large
+    share of per-call latency. On any connection error we drop the socket and
+    retry once with a fresh one.
+    """
     lib = _cfg("zotero_library_id")
     key = _cfg("zotero_api_key")
     if not lib or not key:
         return None
-    url = f"https://api.zotero.org/users/{lib}/{endpoint}"
+    path = f"/users/{lib}/{endpoint}"
     try:
-        resp = urlopen(Request(url, headers={"Zotero-API-Key": key}), timeout=30)
+        c = _conn()
+        c.request("GET", path, headers={
+            "Zotero-API-Key": key,
+            "Zotero-API-Version": "3",
+            "Connection": "keep-alive",
+        })
+        resp = c.getresponse()
+        status = resp.status
         hdrs = {k.lower(): v for k, v in resp.getheaders()}
-        return resp.status, hdrs, resp.read().decode("utf-8")
+        body = resp.read().decode("utf-8")  # must drain before next request
+        return status, hdrs, body
     except Exception:
+        try:
+            if getattr(_tls, "conn", None) is not None:
+                _tls.conn.close()
+        except Exception:
+            pass
+        _tls.conn = None
+        if _retry:
+            return _api(endpoint, _retry=False)
         return None
+
+
+def _close_conns():
+    try:
+        if getattr(_tls, "conn", None) is not None:
+            _tls.conn.close()
+            _tls.conn = None
+    except Exception:
+        pass
 
 
 def _lib_version():
@@ -67,133 +108,62 @@ def _lib_version():
     return int(r[1].get("last-modified-version", "0"))
 
 
-def _fetch_since(ver):
-    items, start = [], 0
-    while True:
-        r = _api(f"items?since={ver}&limit=100&start={start}")
-        if not r or r[0] != 200:
-            break
-        batch = json.loads(r[2])
-        if not batch:
-            break
-        items.extend(batch)
-        if len(batch) < 100:
-            break
-        start += 100
-    return items
+def _fetch_items_since(since):
+    """Fetch all items changed since a library version, in bulk.
 
-
-def _get_item(key):
-    if key in _cache:
-        return _cache[key]
-    r = _api(f"items/{key}")
+    Uses the Total-Results header from the first page to fetch the remaining
+    pages in parallel. On an incremental sync this is a single small request;
+    on a full pull (since=0) it pages through the library efficiently.
+    """
+    r = _api(f"items?since={since}&limit=100&start=0")
     if not r or r[0] != 200:
-        return None
-    item = json.loads(r[2])
-    _cache[key] = item
-    return item
+        return []
+    items = json.loads(r[2])
+    try:
+        total = int(r[1].get("total-results", len(items)))
+    except (TypeError, ValueError):
+        total = len(items)
+    if total <= len(items) or len(items) < 100:
+        return items
+    starts = list(range(100, total, 100))
 
+    def _page(s):
+        rr = _api(f"items?since={since}&limit=100&start={s}")
+        if not rr or rr[0] != 200:
+            return []
+        try:
+            return json.loads(rr[2])
+        except Exception:
+            return []
 
-def _bib_parent(key):
-    cur = _get_item(key)
-    for _ in range(5):
-        if not cur:
-            return None
-        if cur["data"].get("itemType", "") not in ("attachment", "note", "annotation"):
-            return cur
-        pk = cur["data"].get("parentItem")
-        if not pk:
-            return None
-        cur = _get_item(pk)
-    return None
-
-
-def _fetch_tagged(tag):
-    """Fetch ALL items carrying a given tag (version-independent).
-
-    This is the reliable way to detect items the user just tagged: it does not
-    depend on library-version bookkeeping, so 'tag it → sync → imported' always
-    works, even on a freshly reset state.
-    """
-    items, start = [], 0
-    enc = quote(tag, safe="")
-    while True:
-        r = _api(f"items?tag={enc}&limit=100&start={start}")
-        if not r or r[0] != 200:
-            break
-        batch = json.loads(r[2])
-        if not batch:
-            break
-        items.extend(batch)
-        if len(batch) < 100:
-            break
-        start += 100
+    with ThreadPoolExecutor(max_workers=min(6, len(starts))) as ex:
+        for chunk in ex.map(_page, starts):
+            items.extend(chunk)
     return items
 
 
-def _children(key):
-    """Fetch direct child items of an item (attachments, notes, annotations)."""
-    items, start = [], 0
-    while True:
-        r = _api(f"items/{key}/children?limit=100&start={start}")
+def _items_by_keys(keys):
+    """Fetch items by key in batches of 50 (parallel). Returns {key: item}."""
+    out = {}
+    keys = [k for k in dict.fromkeys(keys) if k]
+    if not keys:
+        return out
+    batches = [keys[i:i + 50] for i in range(0, len(keys), 50)]
+
+    def _b(batch):
+        r = _api(f"items?itemKey={','.join(batch)}&limit=50")
         if not r or r[0] != 200:
-            break
-        batch = json.loads(r[2])
-        if not batch:
-            break
-        items.extend(batch)
-        if len(batch) < 100:
-            break
-        start += 100
-    return items
+            return []
+        try:
+            return json.loads(r[2])
+        except Exception:
+            return []
 
-
-def _descendant_annotations(source_key):
-    """All notes/annotations belonging to a source.
-
-    Source → child notes (standalone notes) and child attachments;
-    attachment → annotations (highlights, sticky notes). Walks two levels deep,
-    which covers Zotero's PDF/HTML annotation structure.
-    """
-    out = []
-    for ch in _children(source_key):
-        t = ch["data"].get("itemType", "")
-        if t in ("note", "annotation"):
-            out.append(ch)
-        elif t == "attachment":
-            for gch in _children(ch["key"]):
-                if gch["data"].get("itemType", "") in ("note", "annotation"):
-                    out.append(gch)
+    with ThreadPoolExecutor(max_workers=min(6, len(batches))) as ex:
+        for items in ex.map(_b, batches):
+            for it in items:
+                out[it["key"]] = it
     return out
-
-
-def _fetch_recent(item_type, cutoff):
-    """Fetch items of a type, newest first, stopping once we pass the cutoff.
-
-    Because results are sorted by dateAdded descending, we can stop paginating
-    as soon as we hit an item older than the cutoff. This keeps the sync fast:
-    we only ever pull the annotations/notes created on or after the cutoff
-    instead of the entire library.
-    """
-    items, start = [], 0
-    while True:
-        r = _api(f"items?itemType={item_type}&sort=dateAdded&direction=desc&limit=100&start={start}")
-        if not r or r[0] != 200:
-            break
-        batch = json.loads(r[2])
-        if not batch:
-            break
-        stop = False
-        for it in batch:
-            dadd = (it["data"].get("dateAdded") or "")[:10]
-            if cutoff and dadd and dadd < cutoff:
-                stop = True
-                break
-            items.append(it)
-        if stop or len(batch) < 100:
-            break
-        start += 100
-    return items
 
 
 def _imported_keys(src_tag, ext_tag):
@@ -602,13 +572,14 @@ def _clean_annotation_text(text):
 # Main sync
 # ============================================================
 
-def sync():
+def sync(full=False):
     """Sync from Zotero. Returns (sources_created, extracts_created).
 
-    Tag-driven and version-independent: every item carrying the import tag is
-    scanned (and its annotations/notes), importing whatever is not already in
-    the collection. This makes 'tag an item → sync → imported' reliable, even
-    right after resetting the sync state.
+    Incremental: pulls only items changed since the last successful sync via the
+    Zotero version feed (``items?since=...``) — usually a single small request.
+    A full pull (``full=True``, or first run / after reset) pages the whole
+    library in bulk. Sources are detected by the import tag; extracts
+    (annotations/notes) are imported only if created on/after the cutoff date.
     """
     lib_id = _cfg("zotero_library_id")
     api_key = _cfg("zotero_api_key")
@@ -619,9 +590,9 @@ def sync():
     _cache.clear()
     state = _load_state()
 
-    # Validate credentials / connectivity (also used to stamp last_sync).
     cur_ver = _lib_version()
     if cur_ver is None:
+        _close_conns()
         showInfo("Zotero: Failed to connect. Check your Library ID and API Key.")
         return 0, 0
 
@@ -629,40 +600,45 @@ def sync():
     hl_color = (_cfg("zotero_highlight_color") or "#ffd400").lower()
     src_tag = _cfg("source_tag") or "ir::source"
     ext_tag = _cfg("extract_tag") or "ir::extract"
-    # Extracts (annotations/notes) are only imported if created on/after this
-    # cutoff date. Sources always import. This guards against re-importing old
-    # highlights after a wipe-and-resync.
     cutoff = (_cfg("zotero_extract_cutoff_date") or "").strip()
 
-    # Prefetch already-imported keys ONCE (fast), instead of scanning per item.
+    last_sync = 0 if full else int(state.get("last_sync", 0) or 0)
     source_keys, existing_keys = _imported_keys(src_tag, ext_tag)
 
-    tagged = _fetch_tagged(import_tag)
-    # Sources = bibliographic (top-level) items carrying the tag.
-    source_items = [it for it in tagged
-                    if it["data"].get("itemType", "") not in ("attachment", "note", "annotation")]
-
-    if not source_items:
-        state["last_sync"] = cur_ver
-        _save_state(state)
-        showInfo(f"Zotero: no items tagged '{import_tag}' were found.\n"
-                 f"Make sure the tag matches exactly (it is case-sensitive) and that "
-                 f"the item is tagged in Zotero, then sync.")
+    # Incremental fast path: nothing changed since the last sync.
+    if not full and last_sync and last_sync >= cur_ver:
+        _close_conns()
+        tooltip("Zotero: already up to date.")
         return 0, 0
 
-    sources, extracts = 0, 0
-    tagged_source_keys = set()
+    changed = _fetch_items_since(last_sync)
+    idx = {it["key"]: it for it in changed}
 
-    # Pass 1: sources (always imported if missing).
-    for src in source_items:
-        skey = src["key"]
-        _cache[skey] = src
-        tagged_source_keys.add(skey)
+    def _is_tagged_source(it):
+        d = it["data"]
+        if d.get("itemType", "") in ("attachment", "note", "annotation"):
+            return False
+        return any(t.get("tag", "") == import_tag for t in d.get("tags", []))
+
+    # Tagged sources = already-imported ones + newly-tagged ones in the feed.
+    tagged_source_keys = set(source_keys)
+    feed_sources = {}
+    for it in changed:
+        if _is_tagged_source(it):
+            tagged_source_keys.add(it["key"])
+            feed_sources[it["key"]] = it
+
+    sources, extracts = 0, 0
+    source_meta = {}  # skey -> (ref, tag)
+
+    # Create any missing sources.
+    for skey, src in feed_sources.items():
         d = src["data"]
-        if skey in source_keys:
-            continue
         title, year, authors = _item_data(d)
         ref, tag, ra = _fmt_authors(authors, year, title)
+        source_meta[skey] = (ref, tag)
+        if skey in source_keys:
+            continue
         yr = f" ({year})" if year else ""
         text = _fmt_math(f"{title}, {ra}{yr}")
         back = f'<a href="zotero://select/library/items/{skey}">SourceID: {skey}</a>'
@@ -673,27 +649,69 @@ def sync():
             sources += 1
             source_keys.add(skey)
 
-    # Pass 2: extracts. Only recent annotations/notes (>= cutoff) are pulled,
-    # in bulk, then matched to a tagged source via their parent chain. This is
-    # far faster than enumerating every source's children every sync.
-    recent = _fetch_recent("annotation", cutoff) + _fetch_recent("note", cutoff)
-    for it in recent:
-        ckey = it["key"]
-        cd = it["data"]
+    # Candidate extracts in the feed.
+    annotations = [it for it in changed if it["data"].get("itemType") == "annotation"]
+    notes = [it for it in changed if it["data"].get("itemType") == "note"]
+
+    # Resolve attachments referenced by annotations but absent from the feed.
+    need_att = {a["data"].get("parentItem") for a in annotations}
+    need_att = {k for k in need_att if k and k not in idx}
+    fetched_att = _items_by_keys(need_att)
+
+    def _att(k):
+        return idx.get(k) or fetched_att.get(k)
+
+    def _source_of_note(n):
+        pk = n["data"].get("parentItem")
+        item = idx.get(pk) or fetched_att.get(pk)
+        if item and item["data"].get("itemType") == "attachment":
+            return item["data"].get("parentItem")
+        return pk
+
+    # Resolve source items we still need (to check the tag + build references).
+    need_src = set()
+    for a in annotations:
+        att = _att(a["data"].get("parentItem"))
+        sk = att["data"].get("parentItem") if att else None
+        if sk and sk not in idx and sk not in feed_sources and sk not in source_meta:
+            need_src.add(sk)
+    for n in notes:
+        sk = _source_of_note(n)
+        if sk and sk not in idx and sk not in feed_sources and sk not in source_meta:
+            need_src.add(sk)
+    fetched_src = _items_by_keys(need_src)
+    for sk, it in fetched_src.items():
+        d = it["data"]
+        if d.get("itemType", "") in ("attachment", "note", "annotation"):
+            continue
+        if sk in source_keys or any(t.get("tag", "") == import_tag for t in d.get("tags", [])):
+            tagged_source_keys.add(sk)
+        title, year, authors = _item_data(d)
+        ref, tag, _ = _fmt_authors(authors, year, title)
+        source_meta.setdefault(sk, (ref, tag))
+
+    # Build the work list (item, source_key) for extracts under tagged sources.
+    work = []
+    for a in annotations:
+        att = _att(a["data"].get("parentItem"))
+        sk = att["data"].get("parentItem") if att else None
+        if sk and sk in tagged_source_keys:
+            work.append((a, sk))
+    for n in notes:
+        sk = _source_of_note(n)
+        if sk and sk in tagged_source_keys:
+            work.append((n, sk))
+
+    for ch, skey in work:
+        ckey = ch["key"]
+        cd = ch["data"]
         itype = cd.get("itemType", "")
         if ckey in existing_keys:
             continue
         created = (cd.get("dateAdded") or cd.get("dateModified") or "")
         if cutoff and created and created[:10] < cutoff:
             continue
-
-        _cache[ckey] = it
-        parent = _bib_parent(ckey)
-        if not parent or parent["key"] not in tagged_source_keys:
-            continue
-        skey = parent["key"]
-        title, year, authors = _item_data(parent["data"])
-        ref, tag, _ = _fmt_authors(authors, year, title)
+        ref, tag = source_meta.get(skey, ("", ""))
 
         if itype == "annotation":
             ann_type = cd.get("annotationType", "")
@@ -738,11 +756,17 @@ def sync():
 
     state["last_sync"] = cur_ver
     _save_state(state)
+    _close_conns()
     return sources, extracts
 
 
+def full_resync():
+    """Force a full re-scan of the whole library (bulk), honouring the cutoff."""
+    return sync(full=True)
+
+
 def reset_state():
-    """Reset sync state. Sync is tag-driven, so this only clears bookkeeping;
-    the next sync re-scans all tagged items and imports anything missing."""
+    """Reset sync state. The next sync becomes a full re-scan (since=0),
+    importing tagged sources and extracts created on/after the cutoff date."""
     _save_state({})
-    tooltip("Zotero sync state reset. Next sync re-scans all tagged items.")
+    tooltip("Zotero sync state reset. Next sync does a full re-scan.")

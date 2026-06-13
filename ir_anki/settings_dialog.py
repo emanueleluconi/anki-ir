@@ -15,7 +15,7 @@ def show_settings():
         "auto_postpone": True, "postpone_protection": 10, "mercy_days": 14,
         "topic_item_ratio": 5,
         "source_cap_default": 0, "extract_cap_default": 0,
-        "source_default_interval": 3,
+        "source_default_interval": 3, "extract_priority_offset": 2,
         "source_tag": "ir::source", "extract_tag": "ir::extract",
         "highlight_extract": "#5b9bd5", "highlight_cloze": "#c9a227",
         "key_extract": "x", "key_cloze": "z", "key_priority": "Shift+p",
@@ -80,6 +80,7 @@ def show_settings():
         ("randomization_degree", "Randomization (0-100)", "int"),
         ("topic_item_ratio", "Items per topic (interleave ratio)", "int"),
         ("source_default_interval", "Source interval (days, fixed cadence)", "int"),
+        ("extract_priority_offset", "Extract priority offset (parent − N)", "int"),
         ("source_cap_default", "Source default interval cap (days, 0=none)", "int"),
         ("extract_cap_default", "Extract default interval cap (days, 0=none)", "int"),
     ])

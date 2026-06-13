@@ -102,13 +102,14 @@ def init_source(note, priority: float = 50.0, cap: int = 0, interval: int = 3):
     put(note, m)
 
 
-def init_extract(note, parent_nid: int, parent_priority: float, cap: int = 0):
+def init_extract(note, parent_nid: int, parent_priority: float, cap: int = 0,
+                 offset: float = 2.0):
     """Initialise a new extract note.
 
-    Priority = parent - 5 so extracts appear before their parent.
+    Priority = parent - offset so extracts surface a little before their parent.
     AF derived from the extract's own (lower) priority.
     """
-    p = scheduler.clamp_priority(parent_priority - 5.0)
+    p = scheduler.clamp_priority(parent_priority - offset)
     m = dict(DEFAULT)
     m["p"]    = p
     m["iv"]   = 1
