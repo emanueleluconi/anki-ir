@@ -91,6 +91,9 @@ def init_source(note, priority: float = 50.0, cap: int = 0, interval: int = 3):
     grows on its own, and the interval defaults to `interval` days (3). The
     interval only changes when the user explicitly reschedules. Priority still
     drives queue ordering.
+
+    The FIRST repetition is scheduled for tomorrow (today + 1) so a new source
+    is seen promptly; the fixed `interval` cadence applies from the next review on.
     """
     p = scheduler.clamp_priority(priority)
     m = dict(DEFAULT)
@@ -98,7 +101,7 @@ def init_source(note, priority: float = 50.0, cap: int = 0, interval: int = 3):
     m["iv"]  = max(1, int(interval))
     m["af"]  = 1.0
     m["cap"] = int(cap) if cap else 0
-    m["due"] = scheduler.date_from_days(m["iv"])
+    m["due"] = scheduler.date_from_days(1)
     put(note, m)
 
 

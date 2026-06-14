@@ -399,9 +399,9 @@ def _ask_new_source_priority(sources):
         if due_today:
             m["due"] = scheduler.today_str()
             save_meta(note.id, m)
-        # Keep the source's fixed interval (don't reset to 1); just control
-        # whether it shows today or after one interval.
-        _set_review(card, max(1, m["iv"]), 0 if due_today else max(1, m["iv"]))
+        # Keep the source's fixed interval (cadence) but show the first
+        # repetition today (if checked) or tomorrow.
+        _set_review(card, max(1, m["iv"]), 0 if due_today else 1)
 
 
 # ============================================================
@@ -2328,7 +2328,7 @@ def _init_topics():
         init_source(note, cfg("default_priority"), cap=_default_cap_for_note(note),
                     interval=int(cfg("source_default_interval") or 3))
         mw.col.update_note(note)
-        _set_review(card, max(1, get(note)["iv"]), max(1, get(note)["iv"]))
+        _set_review(card, max(1, get(note)["iv"]), 1)
         n += 1
     showInfo(f"Initialized {n} topics.")
 
