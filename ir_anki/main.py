@@ -2070,16 +2070,6 @@ def _zotero_sync():
         tooltip(f"Zotero error: {ex}")
         import traceback; traceback.print_exc()
 
-def _zotero_full_resync():
-    try:
-        from .zotero_sync import full_resync
-        tooltip("Zotero: Full re-scan…")
-        s, e = full_resync()
-        tooltip(f"Zotero (full): {s} sources, {e} extracts created.")
-    except Exception as ex:
-        tooltip(f"Zotero error: {ex}")
-        import traceback; traceback.print_exc()
-
 def _zotero_reset():
     from .zotero_sync import reset_state
     reset_state()
@@ -2187,8 +2177,8 @@ def _show_sources_view():
     layout = QVBoxLayout()
     layout.addWidget(QLabel(
         "In-progress sources, highest priority on top (lower score = higher "
-        "priority).\nSelect one or more rows and Set Priority — changes "
-        "propagate proportionally to child extracts."))
+        "priority).\nClick a column header to sort (click again to reverse). "
+        "Select rows and Set Priority — changes propagate to child extracts."))
 
     table = QTableWidget()
     table.setColumnCount(4)
@@ -2198,10 +2188,29 @@ def _show_sources_view():
     table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     table.verticalHeader().setVisible(False)
     table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+    table.horizontalHeader().setSectionsClickable(True)
+    table.horizontalHeader().setSortIndicatorShown(True)
     layout.addWidget(table)
+
+    # col index → sort, desc flag. Default: priority ascending.
+    sort_state = {"col": 0, "desc": False}
 
     def _plain(html):
         return _re.sub(r'<[^>]+>', '', html or '').replace("&nbsp;", " ").strip()
+
+    def _sort_rows(rows):
+        # rows: (p, iv, due, title, nid)
+        col, desc = sort_state["col"], sort_state["desc"]
+        if col == 1:
+            keyf = lambda r: (r[1], r[0])
+        elif col == 2:
+            # ISO dates sort lexically; missing dates ("-") go last (asc).
+            keyf = lambda r: (r[2] in ("-", ""), r[2])
+        elif col == 3:
+            keyf = lambda r: r[3].lower()
+        else:
+            keyf = lambda r: (r[0], r[3].lower())
+        rows.sort(key=keyf, reverse=desc)
 
     def load():
         rows = []
@@ -2219,8 +2228,10 @@ def _show_sources_view():
             if not title and note.fields:
                 title = _plain(note.fields[0])
             rows.append((m["p"], m["iv"], m.get("due") or "-", title[:160], nid))
-        # Lowest priority score first = highest priority on top.
-        rows.sort(key=lambda r: (r[0], r[4]))
+        _sort_rows(rows)
+        order = (Qt.SortOrder.DescendingOrder if sort_state["desc"]
+                 else Qt.SortOrder.AscendingOrder)
+        table.horizontalHeader().setSortIndicator(sort_state["col"], order)
         table.setRowCount(len(rows))
         for i, (p, iv, due, title, nid) in enumerate(rows):
             it_p = QTableWidgetItem(f"{p:.1f}")
@@ -2238,6 +2249,16 @@ def _show_sources_view():
         table.setColumnWidth(1, 70)
         table.setColumnWidth(2, 110)
         count_lbl.setText(f"{len(rows)} source(s) in progress")
+
+    def on_header_clicked(idx):
+        if sort_state["col"] == idx:
+            sort_state["desc"] = not sort_state["desc"]
+        else:
+            sort_state["col"] = idx
+            sort_state["desc"] = False
+        load()
+
+    table.horizontalHeader().sectionClicked.connect(on_header_clicked)
 
     def selected_nids():
         nids = []
@@ -2309,7 +2330,6 @@ def _add_menu():
     _a("Queue Stats", _show_stats)
     menu.addSeparator()
     _a("Sync from Zotero", _zotero_sync, cfg("key_zotero_sync"))
-    _a("Full Re-scan from Zotero", _zotero_full_resync)
     _a("Import Markdown as Source", _import_markdown_source)
 
 

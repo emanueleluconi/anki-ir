@@ -127,18 +127,34 @@ def show_settings():
     scroll.setWidget(container)
     dlg_layout.addWidget(scroll)
 
-    # Zotero reset (dangerous action — kept separate from Save/Cancel)
+    # Zotero maintenance actions (kept separate from Save/Cancel)
+    zotero_resync_btn = QPushButton("Full Re-scan from Zotero")
+    zotero_resync_btn.setToolTip("Ignore incremental state and re-scan the whole library: "
+                                 "imports any missing tagged sources and extracts created on/after "
+                                 "the cutoff date. Additive — never deletes. Use after a wipe or to backfill.")
     zotero_reset_btn = QPushButton("Reset Zotero Sync State")
-    zotero_reset_btn.setToolTip("Clears the sync version baseline. Next sync will set a new baseline without re-importing existing notes.")
+    zotero_reset_btn.setToolTip("Clears the sync version baseline. The next sync becomes a full re-scan.")
     zotero_reset_row = QHBoxLayout()
+    zotero_reset_row.addWidget(zotero_resync_btn)
     zotero_reset_row.addWidget(zotero_reset_btn)
     zotero_reset_row.addStretch()
     dlg_layout.addLayout(zotero_reset_row)
+
+    def do_zotero_resync():
+        from aqt.utils import tooltip
+        from .zotero_sync import full_resync
+        try:
+            tooltip("Zotero: Full re-scan…")
+            s, e = full_resync()
+            tooltip(f"Zotero (full): {s} sources, {e} extracts created.")
+        except Exception as ex:
+            tooltip(f"Zotero error: {ex}")
 
     def do_zotero_reset():
         from .zotero_sync import reset_state
         reset_state()
 
+    zotero_resync_btn.clicked.connect(do_zotero_resync)
     zotero_reset_btn.clicked.connect(do_zotero_reset)
 
     # Buttons (outside scroll area, always visible)
